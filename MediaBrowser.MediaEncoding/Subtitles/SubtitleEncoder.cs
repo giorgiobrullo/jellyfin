@@ -199,7 +199,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         {
             if (!subtitleStream.IsExternal || subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
             {
-                await ExtractAllExtractableSubtitles(mediaSource, cancellationToken).ConfigureAwait(false);
+                // Extract the requested track first for fast availability,
+                // then lazily extract remaining tracks in the background.
+                await ExtractSingleSubtitle(mediaSource, subtitleStream, cancellationToken).ConfigureAwait(false);
+                _ = Task.Run(() => ExtractRemainingSubtitlesAsync(mediaSource, subtitleStream.Index), CancellationToken.None);
 
                 var outputFileExtension = GetExtractableSubtitleFileExtension(subtitleStream);
                 var outputFormat = GetExtractableSubtitleFormat(subtitleStream);
@@ -532,6 +535,165 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             catch (Exception ex)
             {
                 _logger.LogWarning(ex, "Unable to get streams for File:{File}", mediaSource.Path);
+            }
+            finally
+            {
+                locks.ForEach(x => x.Dispose());
+            }
+        }
+
+        /// <summary>
+        /// Extracts a single subtitle track from the media source.
+        /// Used to prioritize the selected subtitle for fast availability.
+        /// </summary>
+        private async Task ExtractSingleSubtitle(
+            MediaSourceInfo mediaSource,
+            MediaStream subtitleStream,
+            CancellationToken cancellationToken)
+        {
+            if (!subtitleStream.IsExtractableSubtitleStream || !subtitleStream.SupportsExternalStream)
+            {
+                return;
+            }
+
+            // MKS subtitles are handled by ExtractAllExtractableSubtitlesMKS
+            if (subtitleStream.IsExternal && !subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
+            {
+                return;
+            }
+
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + GetExtractableSubtitleFileExtension(subtitleStream));
+
+            var releaser = await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (File.Exists(outputPath))
+                {
+                    return;
+                }
+
+                // Handle MKS files separately
+                if (!string.IsNullOrEmpty(subtitleStream.Path) && subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
+                {
+                    await ExtractAllExtractableSubtitlesMKS(mediaSource, new List<MediaStream> { subtitleStream }, cancellationToken).ConfigureAwait(false);
+                    return;
+                }
+
+                var inputPath = _mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource);
+                var outputCodec = IsCodecCopyable(subtitleStream.Codec) ? "copy" : "srt";
+                var streamIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, subtitleStream);
+
+                if (streamIndex == -1)
+                {
+                    _logger.LogError("Cannot find subtitle stream index for {InputPath} ({Index}), skipping", inputPath, subtitleStream.Index);
+                    return;
+                }
+
+                Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? throw new FileNotFoundException($"Calculated path ({outputPath}) is not valid."));
+
+                var args = string.Format(
+                    CultureInfo.InvariantCulture,
+                    "-i {0} -copyts -map 0:{1} -an -vn -c:s {2} \"{3}\"",
+                    inputPath,
+                    streamIndex,
+                    outputCodec,
+                    outputPath);
+
+                await ExtractSubtitlesForFile(inputPath, args, new List<string> { outputPath }, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to extract single subtitle track {Index} for {File}", subtitleStream.Index, mediaSource.Path);
+            }
+            finally
+            {
+                releaser.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Extracts remaining subtitle tracks in the background after the priority track.
+        /// Text subtitles are extracted first, then PGS (bitmap) subtitles.
+        /// </summary>
+        private async Task ExtractRemainingSubtitlesAsync(MediaSourceInfo mediaSource, int alreadyExtractedIndex)
+        {
+            try
+            {
+                var subtitleStreams = mediaSource.MediaStreams
+                    .Where(stream => stream is { IsExtractableSubtitleStream: true, SupportsExternalStream: true }
+                        && stream.Index != alreadyExtractedIndex)
+                    .ToList();
+
+                if (subtitleStreams.Count == 0)
+                {
+                    return;
+                }
+
+                // Extract text subs first (small, fast), then PGS (large, slow)
+                var textStreams = subtitleStreams.Where(s => s.IsTextSubtitleStream).ToList();
+                var pgsStreams = subtitleStreams.Where(s => s.IsPgsSubtitleStream).ToList();
+
+                if (textStreams.Count > 0)
+                {
+                    _logger.LogInformation("Background extracting {Count} text subtitle tracks for {File}", textStreams.Count, mediaSource.Path);
+                    await ExtractAllExtractableSubtitlesForStreams(mediaSource, textStreams, CancellationToken.None).ConfigureAwait(false);
+                }
+
+                if (pgsStreams.Count > 0)
+                {
+                    _logger.LogInformation("Background extracting {Count} PGS subtitle tracks for {File}", pgsStreams.Count, mediaSource.Path);
+                    await ExtractAllExtractableSubtitlesForStreams(mediaSource, pgsStreams, CancellationToken.None).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Background subtitle extraction failed for {File}", mediaSource.Path);
+            }
+        }
+
+        /// <summary>
+        /// Extracts a specific set of subtitle streams, acquiring locks and skipping already-extracted tracks.
+        /// </summary>
+        private async Task ExtractAllExtractableSubtitlesForStreams(
+            MediaSourceInfo mediaSource,
+            List<MediaStream> subtitleStreams,
+            CancellationToken cancellationToken)
+        {
+            var locks = new List<IDisposable>();
+            var extractableStreams = new List<MediaStream>();
+
+            try
+            {
+                foreach (var subtitleStream in subtitleStreams)
+                {
+                    if (subtitleStream.IsExternal && !subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + GetExtractableSubtitleFileExtension(subtitleStream));
+
+                    var releaser = await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false);
+
+                    if (File.Exists(outputPath))
+                    {
+                        releaser.Dispose();
+                        continue;
+                    }
+
+                    locks.Add(releaser);
+                    extractableStreams.Add(subtitleStream);
+                }
+
+                if (extractableStreams.Count > 0)
+                {
+                    await ExtractAllExtractableSubtitlesInternal(mediaSource, extractableStreams, cancellationToken).ConfigureAwait(false);
+                    await ExtractAllExtractableSubtitlesMKS(mediaSource, extractableStreams, cancellationToken).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Unable to extract subtitle streams for File:{File}", mediaSource.Path);
             }
             finally
             {
