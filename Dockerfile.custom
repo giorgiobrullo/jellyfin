@@ -1,0 +1,7 @@
+FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+WORKDIR /src
+COPY . .
+RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build
+
+FROM ghcr.io/hotio/jellyfin:release
+COPY --from=build /build/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
