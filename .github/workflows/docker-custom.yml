@@ -2,7 +2,7 @@ name: Build Custom Jellyfin
 
 on:
   push:
-    branches: [fix/prioritize-subtitle-extraction, custom-patches]
+    branches: [custom-patches]
   workflow_dispatch:
 
 env:
