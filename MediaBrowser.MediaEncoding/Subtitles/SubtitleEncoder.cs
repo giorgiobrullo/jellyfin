@@ -579,6 +579,9 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     return;
                 }
 
+                _logger.LogDebug("Extracting selected subtitle track {Index} ({Language}/{Codec}) for {File}", subtitleStream.Index, subtitleStream.Language, subtitleStream.Codec, mediaSource.Path);
+                var extractionStart = System.Diagnostics.Stopwatch.StartNew();
+
                 var inputPath = _mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource);
                 var outputCodec = IsCodecCopyable(subtitleStream.Codec) ? "copy" : "srt";
                 var streamIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, subtitleStream);
@@ -600,6 +603,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     outputPath);
 
                 await ExtractSubtitlesForFile(inputPath, args, new List<string> { outputPath }, cancellationToken).ConfigureAwait(false);
+                extractionStart.Stop();
+                _logger.LogInformation("Extracted selected subtitle track {Index} ({Language}/{Codec}) in {Time}ms for {File}", subtitleStream.Index, subtitleStream.Language, subtitleStream.Codec, extractionStart.ElapsedMilliseconds, mediaSource.Path);
             }
             catch (Exception ex)
             {
