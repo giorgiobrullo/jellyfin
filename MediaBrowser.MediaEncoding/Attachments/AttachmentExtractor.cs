@@ -238,10 +238,27 @@ namespace MediaBrowser.MediaEncoding.Attachments
             MediaAttachment mediaAttachment,
             CancellationToken cancellationToken)
         {
-            var attachmentFolderPath = _pathManager.GetAttachmentFolderPath(mediaSource.Id);
-            using (await _semaphoreLocks.LockAsync(attachmentFolderPath, cancellationToken).ConfigureAwait(false))
+            var attachmentPath = _pathManager.GetAttachmentPath(mediaSource.Id, mediaAttachment.FileName ?? mediaAttachment.Index.ToString(CultureInfo.InvariantCulture));
+
+            // Fast path: already on disk from a previous bulk/single extraction.
+            if (File.Exists(attachmentPath))
             {
-                var attachmentPath = _pathManager.GetAttachmentPath(mediaSource.Id, mediaAttachment.FileName ?? mediaAttachment.Index.ToString(CultureInfo.InvariantCulture));
+                return attachmentPath;
+            }
+
+            // Miss. ExtractAllAttachments dumps every attachment in a single
+            // ffmpeg pass. That's cheap for local files, but critical for
+            // HTTP/streaming sources where a per-attachment extraction would
+            // re-open the remote stream and download through it once per font
+            // (10+ fonts × tens of seconds each → minutes of subtitle stalling).
+            await ExtractAllAttachments(inputFile, mediaSource, cancellationToken).ConfigureAwait(false);
+
+            // ExtractAllAttachments takes its own folder lock and writes every
+            // attachment in the source. If the requested file still isn't on
+            // disk, fall back to the per-attachment extract under our own
+            // lock — the bulk pass may have skipped an attachment we need.
+            using (await _semaphoreLocks.LockAsync(_pathManager.GetAttachmentFolderPath(mediaSource.Id), cancellationToken).ConfigureAwait(false))
+            {
                 if (!File.Exists(attachmentPath))
                 {
                     await ExtractAttachmentInternal(
