@@ -601,6 +601,12 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     ? mediaSource.RunTimeTicks.Value / (double)TimeSpan.TicksPerSecond
                     : 0;
                 var supportedFormat = string.Equals(outputCodec, "copy", StringComparison.OrdinalIgnoreCase) ? "ass" : outputCodec;
+                _logger.LogInformation(
+                    "Single subtitle extraction decision for track {Index}: durationSeconds={Duration}, format={Format}, willUseParallel={UseParallel}",
+                    subtitleStream.Index,
+                    durationSeconds,
+                    supportedFormat,
+                    durationSeconds >= 600 && (supportedFormat == "ass" || supportedFormat == "srt"));
                 if (durationSeconds >= 600 && (supportedFormat == "ass" || supportedFormat == "srt"))
                 {
                     try
