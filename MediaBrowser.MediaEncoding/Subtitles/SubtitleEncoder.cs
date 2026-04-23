@@ -595,7 +595,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
                 var args = string.Format(
                     CultureInfo.InvariantCulture,
-                    "-i {0} -copyts -map 0:{1} -an -vn -c:s {2} \"{3}\"",
+                    "-i {0} -map 0:{1} -an -vn -c:s {2} -flush_packets 1 \"{3}\"",
                     inputPath,
                     streamIndex,
                     outputCodec,
