@@ -594,6 +594,43 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
                 Directory.CreateDirectory(Path.GetDirectoryName(outputPath) ?? throw new FileNotFoundException($"Calculated path ({outputPath}) is not valid."));
 
+                // For long-running HTTP sources, ffmpeg has to demux the entire container to
+                // be sure it's seen every subtitle packet. On a 10GB+ remote mkv that's ~50s
+                // of linear read. We can break that into N chunks extracted in parallel with
+                // -ss/-to, then merge. Each chunk pulls only its slice via HTTP range requests.
+                var durationSeconds = mediaSource.RunTimeTicks.HasValue
+                    ? mediaSource.RunTimeTicks.Value / (double)TimeSpan.TicksPerSecond
+                    : 0;
+                var supportedFormat = string.Equals(outputCodec, "copy", StringComparison.OrdinalIgnoreCase) ? "ass" : outputCodec;
+                if (durationSeconds >= 600 && (supportedFormat == "ass" || supportedFormat == "srt"))
+                {
+                    try
+                    {
+                        await ExtractSingleSubtitleParallel(
+                            inputPath,
+                            streamIndex,
+                            outputCodec,
+                            outputPath,
+                            durationSeconds,
+                            supportedFormat,
+                            cancellationToken).ConfigureAwait(false);
+                        extractionStart.Stop();
+                        _logger.LogInformation("Extracted selected subtitle track {Index} ({Language}/{Codec}) in {Time}ms (parallel) for {File}", subtitleStream.Index, subtitleStream.Language, subtitleStream.Codec, extractionStart.ElapsedMilliseconds, mediaSource.Path);
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Parallel subtitle extraction failed; falling back to single-pass for track {Index}", subtitleStream.Index);
+                        try
+                        {
+                            _fileSystem.DeleteFile(outputPath);
+                        }
+                        catch (FileNotFoundException)
+                        {
+                        }
+                    }
+                }
+
                 var args = string.Format(
                     CultureInfo.InvariantCulture,
                     "-i {0} -map 0:{1} -an -vn -c:s {2} -flush_packets 1 \"{3}\"",
@@ -614,6 +651,298 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             {
                 releaser.Dispose();
             }
+        }
+
+        /// <summary>
+        /// Splits the source into N time ranges and extracts each in parallel via -ss/-to,
+        /// then merges the ASS/SRT outputs. Designed for slow HTTP sources where a single
+        /// linear demux dominates wall-clock time.
+        /// </summary>
+        private async Task ExtractSingleSubtitleParallel(
+            string inputPath,
+            int streamIndex,
+            string outputCodec,
+            string outputPath,
+            double durationSeconds,
+            string format,
+            CancellationToken cancellationToken)
+        {
+            const int numChunks = 4;
+            const double overlapSeconds = 20;
+            var chunkSize = durationSeconds / numChunks;
+
+            var outputDir = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException("Invalid output path", nameof(outputPath));
+            var baseName = Path.GetFileNameWithoutExtension(outputPath);
+            var tempDir = Path.Combine(outputDir, $"_chunks_{baseName}_{Guid.NewGuid():N}");
+            Directory.CreateDirectory(tempDir);
+
+            var chunkPaths = new List<string>();
+            var tasks = new List<Task>();
+
+            try
+            {
+                for (var i = 0; i < numChunks; i++)
+                {
+                    var rawStart = i * chunkSize;
+                    var rawEnd = (i == numChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
+                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : overlapSeconds));
+                    var end = Math.Min(durationSeconds, rawEnd + overlapSeconds);
+                    var chunkPath = Path.Combine(tempDir, $"chunk_{i}.{format}");
+                    chunkPaths.Add(chunkPath);
+
+                    // -ss before -i: input seek (fast for HTTP, uses container index)
+                    // -copyts: keep absolute timestamps so events line up across chunks
+                    var args = string.Format(
+                        CultureInfo.InvariantCulture,
+                        "-ss {0} -to {1} -i {2} -map 0:{3} -an -vn -copyts -c:s {4} -flush_packets 1 \"{5}\"",
+                        start.ToString("F3", CultureInfo.InvariantCulture),
+                        end.ToString("F3", CultureInfo.InvariantCulture),
+                        inputPath,
+                        streamIndex,
+                        outputCodec,
+                        chunkPath);
+
+                    tasks.Add(ExtractSubtitlesForFile(inputPath, args, new List<string> { chunkPath }, cancellationToken));
+                }
+
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+
+                // Verify at least one chunk produced output; fall through to throw if all empty.
+                var anyProduced = chunkPaths.Any(p => File.Exists(p) && new FileInfo(p).Length > 0);
+                if (!anyProduced)
+                {
+                    throw new InvalidOperationException("All subtitle chunks produced empty output");
+                }
+
+                if (string.Equals(format, "ass", StringComparison.OrdinalIgnoreCase))
+                {
+                    MergeAssChunks(chunkPaths, outputPath);
+                }
+                else
+                {
+                    MergeSrtChunks(chunkPaths, outputPath);
+                }
+            }
+            finally
+            {
+                try
+                {
+                    Directory.Delete(tempDir, recursive: true);
+                }
+                catch (IOException ex)
+                {
+                    _logger.LogDebug(ex, "Failed to clean up subtitle chunk tempdir {Dir}", tempDir);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Merges N ASS chunk files into a single output file. Takes the header from the
+        /// first non-empty chunk and deduplicates Dialogue/Comment lines from [Events].
+        /// </summary>
+        private static void MergeAssChunks(IReadOnlyList<string> chunkPaths, string outputPath)
+        {
+            string? header = null;
+            string? eventsFormatLine = null;
+            var seenEvents = new HashSet<string>(StringComparer.Ordinal);
+            var orderedEvents = new List<(double StartSeconds, string Line)>();
+
+            foreach (var chunkPath in chunkPaths)
+            {
+                if (!File.Exists(chunkPath) || new FileInfo(chunkPath).Length == 0)
+                {
+                    continue;
+                }
+
+                var lines = File.ReadAllLines(chunkPath);
+                var eventsIdx = -1;
+                for (var i = 0; i < lines.Length; i++)
+                {
+                    if (lines[i].StartsWith("[Events]", StringComparison.OrdinalIgnoreCase))
+                    {
+                        eventsIdx = i;
+                        break;
+                    }
+                }
+
+                if (eventsIdx == -1)
+                {
+                    continue;
+                }
+
+                if (header is null)
+                {
+                    // Header = everything up to and including [Events] + Format: line from this chunk.
+                    var sb = new StringBuilder();
+                    for (var i = 0; i <= eventsIdx; i++)
+                    {
+                        sb.AppendLine(lines[i]);
+                    }
+
+                    // The line after [Events] should be "Format: ..."
+                    if (eventsIdx + 1 < lines.Length && lines[eventsIdx + 1].StartsWith("Format:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        eventsFormatLine = lines[eventsIdx + 1];
+                        sb.AppendLine(eventsFormatLine);
+                    }
+
+                    header = sb.ToString();
+                }
+
+                for (var i = eventsIdx + 1; i < lines.Length; i++)
+                {
+                    var line = lines[i];
+                    if (line.StartsWith("Format:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!line.StartsWith("Dialogue:", StringComparison.OrdinalIgnoreCase)
+                        && !line.StartsWith("Comment:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!seenEvents.Add(line))
+                    {
+                        continue;
+                    }
+
+                    orderedEvents.Add((ParseAssStartSeconds(line), line));
+                }
+            }
+
+            if (header is null)
+            {
+                throw new InvalidOperationException("No chunks had [Events] section");
+            }
+
+            orderedEvents.Sort((a, b) => a.StartSeconds.CompareTo(b.StartSeconds));
+
+            using var writer = new StreamWriter(outputPath, append: false);
+            writer.Write(header);
+            foreach (var (_, line) in orderedEvents)
+            {
+                writer.WriteLine(line);
+            }
+        }
+
+        /// <summary>
+        /// Parses the start time of an ASS Dialogue/Comment line as seconds. Format after the
+        /// comma splits is "H:MM:SS.CS" at index 1.
+        /// </summary>
+        private static double ParseAssStartSeconds(string dialogueLine)
+        {
+            var colon = dialogueLine.IndexOf(':', StringComparison.Ordinal);
+            if (colon < 0 || colon + 1 >= dialogueLine.Length)
+            {
+                return 0;
+            }
+
+            var parts = dialogueLine.Substring(colon + 1).Split(',');
+            if (parts.Length < 2)
+            {
+                return 0;
+            }
+
+            var timeStr = parts[1].Trim();
+            var timeParts = timeStr.Split(':');
+            if (timeParts.Length != 3)
+            {
+                return 0;
+            }
+
+            if (int.TryParse(timeParts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var h)
+                && int.TryParse(timeParts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var m)
+                && double.TryParse(timeParts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
+            {
+                return (h * 3600) + (m * 60) + s;
+            }
+
+            return 0;
+        }
+
+        /// <summary>
+        /// Merges N SRT chunk files into a single output, deduplicating identical entries and
+        /// renumbering sequentially. Entries are sorted by start time.
+        /// </summary>
+        private static void MergeSrtChunks(IReadOnlyList<string> chunkPaths, string outputPath)
+        {
+            var seen = new HashSet<string>(StringComparer.Ordinal);
+            var entries = new List<(double StartSeconds, string TimeLine, string Text)>();
+
+            foreach (var chunkPath in chunkPaths)
+            {
+                if (!File.Exists(chunkPath) || new FileInfo(chunkPath).Length == 0)
+                {
+                    continue;
+                }
+
+                var text = File.ReadAllText(chunkPath).Replace("\r\n", "\n", StringComparison.Ordinal);
+                foreach (var block in text.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var blockLines = block.Split('\n');
+                    if (blockLines.Length < 2)
+                    {
+                        continue;
+                    }
+
+                    // Skip leading number line if present (we renumber)
+                    var timeLineIdx = blockLines[0].Contains("-->", StringComparison.Ordinal) ? 0 : 1;
+                    if (timeLineIdx >= blockLines.Length)
+                    {
+                        continue;
+                    }
+
+                    var timeLine = blockLines[timeLineIdx];
+                    if (!timeLine.Contains("-->", StringComparison.Ordinal))
+                    {
+                        continue;
+                    }
+
+                    var bodyLines = blockLines.Skip(timeLineIdx + 1).ToArray();
+                    var body = string.Join('\n', bodyLines).TrimEnd();
+                    var dedupKey = timeLine + "|" + body;
+                    if (!seen.Add(dedupKey))
+                    {
+                        continue;
+                    }
+
+                    entries.Add((ParseSrtStartSeconds(timeLine), timeLine, body));
+                }
+            }
+
+            entries.Sort((a, b) => a.StartSeconds.CompareTo(b.StartSeconds));
+
+            using var writer = new StreamWriter(outputPath, append: false);
+            for (var i = 0; i < entries.Count; i++)
+            {
+                writer.WriteLine((i + 1).ToString(CultureInfo.InvariantCulture));
+                writer.WriteLine(entries[i].TimeLine);
+                writer.WriteLine(entries[i].Text);
+                writer.WriteLine();
+            }
+        }
+
+        private static double ParseSrtStartSeconds(string timeLine)
+        {
+            // Format: "00:00:12,345 --> 00:00:15,678"
+            var arrow = timeLine.IndexOf("-->", StringComparison.Ordinal);
+            var startStr = (arrow < 0 ? timeLine : timeLine.Substring(0, arrow)).Trim().Replace(',', '.');
+            var parts = startStr.Split(':');
+            if (parts.Length != 3)
+            {
+                return 0;
+            }
+
+            if (int.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var h)
+                && int.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var m)
+                && double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out var s))
+            {
+                return (h * 3600) + (m * 60) + s;
+            }
+
+            return 0;
         }
 
         /// <summary>
