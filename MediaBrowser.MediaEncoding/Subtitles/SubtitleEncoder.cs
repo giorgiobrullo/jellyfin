@@ -598,17 +598,30 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 // be sure it's seen every subtitle packet. On a 10GB+ remote mkv that's ~50s
                 // of linear read. We can break that into N chunks extracted in parallel with
                 // -ss/-to, then merge. Each chunk pulls only its slice via HTTP range requests.
+                //
+                // Whether this actually speeds things up depends on the upstream pipe:
+                // if the proxy/CDN serves concurrent requests at independent bandwidth, this
+                // is a big win; if it rate-limits or shares bandwidth per-client, parallel
+                // chunks just divvy up the same pipe and you save nothing. Toggle via env
+                // var JELLYFIN_PARALLEL_SUBTITLE_EXTRACTION ('0' / 'false' to disable).
                 var durationSeconds = mediaSource.RunTimeTicks.HasValue
                     ? mediaSource.RunTimeTicks.Value / (double)TimeSpan.TicksPerSecond
                     : 0;
                 var supportedFormat = string.Equals(outputCodec, "copy", StringComparison.OrdinalIgnoreCase) ? "ass" : outputCodec;
+                var parallelEnvVar = Environment.GetEnvironmentVariable("JELLYFIN_PARALLEL_SUBTITLE_EXTRACTION");
+                var parallelEnabled = !string.Equals(parallelEnvVar, "0", StringComparison.Ordinal)
+                    && !string.Equals(parallelEnvVar, "false", StringComparison.OrdinalIgnoreCase);
+                var willUseParallel = parallelEnabled
+                    && durationSeconds >= 600
+                    && (supportedFormat == "ass" || supportedFormat == "srt");
                 _logger.LogInformation(
-                    "Single subtitle extraction decision for track {Index}: durationSeconds={Duration}, format={Format}, willUseParallel={UseParallel}",
+                    "Single subtitle extraction decision for track {Index}: durationSeconds={Duration}, format={Format}, parallelEnabled={Enabled}, willUseParallel={UseParallel}",
                     subtitleStream.Index,
                     durationSeconds,
                     supportedFormat,
-                    durationSeconds >= 600 && (supportedFormat == "ass" || supportedFormat == "srt"));
-                if (durationSeconds >= 600 && (supportedFormat == "ass" || supportedFormat == "srt"))
+                    parallelEnabled,
+                    willUseParallel);
+                if (willUseParallel)
                 {
                     try
                     {
