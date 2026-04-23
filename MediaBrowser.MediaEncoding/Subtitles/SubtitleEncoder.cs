@@ -606,7 +606,15 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 var durationSeconds = mediaSource.RunTimeTicks.HasValue
                     ? mediaSource.RunTimeTicks.Value / (double)TimeSpan.TicksPerSecond
                     : 0;
-                var supportedFormat = string.Equals(outputCodec, "copy", StringComparison.OrdinalIgnoreCase) ? "ass" : outputCodec;
+                // supportedFormat must match the actual subtitle-file extension so the
+                // ffmpeg output muxer (selected from the filename) matches the input's
+                // codec on `-c:s copy`. Previously this was hardcoded to "ass" when
+                // outputCodec=="copy", which produced ASS-extension output for SRT
+                // sources and ffmpeg failed immediately (wrong container).
+                var fileExt = GetExtractableSubtitleFileExtension(subtitleStream);
+                var supportedFormat = string.Equals(outputCodec, "copy", StringComparison.OrdinalIgnoreCase)
+                    ? (fileExt?.ToLowerInvariant() ?? string.Empty)
+                    : outputCodec;
                 var parallelEnvVar = Environment.GetEnvironmentVariable("JELLYFIN_PARALLEL_SUBTITLE_EXTRACTION");
                 var parallelEnabled = !string.Equals(parallelEnvVar, "0", StringComparison.Ordinal)
                     && !string.Equals(parallelEnvVar, "false", StringComparison.OrdinalIgnoreCase);
