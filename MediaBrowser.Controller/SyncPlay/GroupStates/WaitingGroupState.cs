@@ -639,8 +639,9 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 return;
             }
 
-            // Reject the request if the session has not yet demonstrated loading the current item
-            // by reporting a Buffer or Ready event for it. See HandleRequest(NextItemGroupRequest).
+            // Reject the request if the session has not yet demonstrated being in sync on the
+            // current item by reporting a Ready event whose position is within tolerance.
+            // See HandleRequest(NextItemGroupRequest).
             if (!context.IsAcknowledged(session))
             {
                 _logger.LogWarning("Session {SessionId} requested PreviousItem before acknowledging current item in group {GroupId}, ignoring.", session.Id, context.GroupId.ToString());

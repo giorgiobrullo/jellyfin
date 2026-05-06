@@ -135,20 +135,34 @@ namespace MediaBrowser.Controller.SyncPlay
         /// </summary>
         /// <param name="session">The session.</param>
         /// <param name="acknowledged">Whether the session has acknowledged the item.</param>
-        void SetAcknowledged(SessionInfo session, bool acknowledged);
+        /// <remarks>
+        /// Default implementation is a no-op so existing third-party implementations of this
+        /// interface keep working without behavioural change; the in-tree Group overrides it.
+        /// </remarks>
+        void SetAcknowledged(SessionInfo session, bool acknowledged)
+        {
+        }
 
         /// <summary>
         /// Resets the acknowledgement flag for all sessions in the group.
         /// </summary>
         /// <param name="acknowledged">The flag value.</param>
-        void SetAllAcknowledged(bool acknowledged);
+        /// <remarks>See <see cref="SetAcknowledged"/> for default-implementation rationale.</remarks>
+        void SetAllAcknowledged(bool acknowledged)
+        {
+        }
 
         /// <summary>
         /// Checks whether a session has acknowledged the current playlist item.
         /// </summary>
         /// <param name="session">The session.</param>
         /// <returns><c>true</c> if acknowledged; <c>false</c> otherwise.</returns>
-        bool IsAcknowledged(SessionInfo session);
+        /// <remarks>
+        /// Default implementation returns <c>true</c>: existing third-party implementations of
+        /// this interface predate the acknowledgement flag and have no way to track it, so for
+        /// them the NextItem/PreviousItem gate degrades to a no-op (preserving prior behaviour).
+        /// </remarks>
+        bool IsAcknowledged(SessionInfo session) => true;
 
         /// <summary>
         /// Sets the session's group wait state.
