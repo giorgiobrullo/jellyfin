@@ -56,5 +56,19 @@ namespace MediaBrowser.Controller.SyncPlay
         /// </summary>
         /// <value><c>true</c> to ignore member on group wait; <c>false</c> if they're following group playback.</value>
         public bool IgnoreGroupWait { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether this member has acknowledged being in sync on the current playlist item.
+        /// </summary>
+        /// <remarks>
+        /// Set to <c>true</c> when the session reports a Ready event whose PlaylistItemId matches
+        /// the group's current item and whose position passes the offset tolerance check. Reset to
+        /// <c>false</c> on session join and whenever the group's current item changes. Used to
+        /// reject NextItem/PreviousItem requests from sessions that have not yet demonstrated
+        /// loading the current media — for example, a client whose WebSocket reconnected near
+        /// end-of-file and forwarded mpv's EOF event as a queue-advance request before its player
+        /// actually loaded the new item.
+        /// </remarks>
+        public bool HasAcknowledgedCurrentItem { get; set; }
     }
 }

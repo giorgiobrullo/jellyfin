@@ -131,6 +131,26 @@ namespace MediaBrowser.Controller.SyncPlay
         bool IsBuffering();
 
         /// <summary>
+        /// Sets whether the given session has acknowledged loading the current playlist item.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <param name="acknowledged">Whether the session has acknowledged the item.</param>
+        void SetAcknowledged(SessionInfo session, bool acknowledged);
+
+        /// <summary>
+        /// Resets the acknowledgement flag for all sessions in the group.
+        /// </summary>
+        /// <param name="acknowledged">The flag value.</param>
+        void SetAllAcknowledged(bool acknowledged);
+
+        /// <summary>
+        /// Checks whether a session has acknowledged the current playlist item.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <returns><c>true</c> if acknowledged; <c>false</c> otherwise.</returns>
+        bool IsAcknowledged(SessionInfo session);
+
+        /// <summary>
         /// Sets the session's group wait state.
         /// </summary>
         /// <param name="session">The session.</param>
