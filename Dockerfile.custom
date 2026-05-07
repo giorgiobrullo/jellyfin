@@ -2,6 +2,10 @@ FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
 WORKDIR /src
 COPY . .
 RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build
+RUN dotnet build MediaBrowser.Controller/MediaBrowser.Controller.csproj -c Release -o /build
+RUN dotnet build Emby.Server.Implementations/Emby.Server.Implementations.csproj -c Release -o /build
 
 FROM ghcr.io/hotio/jellyfin:release
 COPY --from=build /build/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
+COPY --from=build /build/MediaBrowser.Controller.dll /usr/lib/jellyfin/bin/MediaBrowser.Controller.dll
+COPY --from=build /build/Emby.Server.Implementations.dll /usr/lib/jellyfin/bin/Emby.Server.Implementations.dll
