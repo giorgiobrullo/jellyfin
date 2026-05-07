@@ -165,6 +165,46 @@ namespace MediaBrowser.Controller.SyncPlay
         bool IsAcknowledged(SessionInfo session) => true;
 
         /// <summary>
+        /// Marks whether a corrective Seek command issued to the given session is still in flight.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <param name="inflight">Whether a Seek is in flight to this session.</param>
+        /// <remarks>
+        /// Default implementation is a no-op; the in-tree Group overrides it to gate
+        /// duplicate corrective Seeks emitted while a previous one is still being applied
+        /// by the client. Setting <c>true</c> also stamps the issue time used for the
+        /// safety timeout in <see cref="IsSeekInflight"/>.
+        /// </remarks>
+        void SetSeekInflight(SessionInfo session, bool inflight)
+        {
+        }
+
+        /// <summary>
+        /// Marks all members of the group as having an inflight Seek (or clears the flag).
+        /// </summary>
+        /// <param name="inflight">The flag value.</param>
+        /// <remarks>
+        /// Default implementation is a no-op. Used after a group-wide Seek broadcast (e.g. a
+        /// user-initiated SeekGroupRequest) so that none of the members' subsequent in-flight
+        /// position reports trigger duplicate corrective Seeks.
+        /// </remarks>
+        void SetAllSeekInflight(bool inflight)
+        {
+        }
+
+        /// <summary>
+        /// Returns whether a corrective Seek command to the given session is still presumed to be in flight.
+        /// </summary>
+        /// <param name="session">The session.</param>
+        /// <returns><c>true</c> if a previously issued Seek to this session has not yet been confirmed and the safety timeout has not elapsed; <c>false</c> otherwise.</returns>
+        /// <remarks>
+        /// Default implementation returns <c>false</c>: existing third-party implementations of
+        /// this interface predate the inflight tracking, so for them the suppression degrades
+        /// to a no-op and the original behaviour (always emit the corrective Seek) is preserved.
+        /// </remarks>
+        bool IsSeekInflight(SessionInfo session) => false;
+
+        /// <summary>
         /// Sets the session's group wait state.
         /// </summary>
         /// <param name="session">The session.</param>
