@@ -468,6 +468,19 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 // Session is ready.
                 context.SetBuffering(session, false);
 
+                // Only acknowledge sessions whose reported position is genuinely within tolerance
+                // of the group's authoritative position. The got-lost-in-time check above only
+                // catches paused clients (request.IsPlaying == false); a client that reports
+                // IsPlaying == true but with a position far from the group still falls through
+                // to the recovery flow below, and without this guard would also flip the ack
+                // flag — defeating the NextItem/PreviousItem gate for sessions that have not
+                // really loaded the current item (e.g. mpv still on the previous file post-rejoin
+                // when its position happens to align with the group's).
+                if (Math.Abs(delayTicks) <= maxPlaybackOffsetTicks)
+                {
+                    context.SetAcknowledged(session, true);
+                }
+
                 if (context.IsBuffering())
                 {
                     // Others are still buffering, tell this client to pause when ready.
@@ -536,6 +549,7 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // Session is ready.
                 context.SetBuffering(session, false);
+                context.SetAcknowledged(session, true);
 
                 if (!context.IsBuffering())
                 {
@@ -575,6 +589,19 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
                 _logger.LogDebug("Session {SessionId} provided the wrong playlist item for group {GroupId}.", session.Id, context.GroupId.ToString());
+                return;
+            }
+
+            // Reject the request if the session has not yet demonstrated being in sync on the
+            // current item by reporting a Ready event whose position is within tolerance. This
+            // prevents a session whose WebSocket reconnected near end-of-file from forwarding
+            // mpv's EOF event as a queue advance: the client's NextItem would otherwise carry
+            // the freshly-broadcast current PlaylistItemId and pass the equality check above
+            // without the client ever having loaded that item. A Ready that triggers a position
+            // correction (got-lost-in-time / seeking-to-wrong-position) does not flip the flag.
+            if (!context.IsAcknowledged(session))
+            {
+                _logger.LogWarning("Session {SessionId} requested NextItem before acknowledging current item in group {GroupId}, ignoring.", session.Id, context.GroupId.ToString());
                 return;
             }
 
@@ -621,6 +648,15 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
             if (!request.PlaylistItemId.Equals(context.PlayQueue.GetPlayingItemPlaylistId()))
             {
                 _logger.LogDebug("Session {SessionId} provided the wrong playlist item for group {GroupId}.", session.Id, context.GroupId.ToString());
+                return;
+            }
+
+            // Reject the request if the session has not yet demonstrated being in sync on the
+            // current item by reporting a Ready event whose position is within tolerance.
+            // See HandleRequest(NextItemGroupRequest).
+            if (!context.IsAcknowledged(session))
+            {
+                _logger.LogWarning("Session {SessionId} requested PreviousItem before acknowledging current item in group {GroupId}, ignoring.", session.Id, context.GroupId.ToString());
                 return;
             }
 

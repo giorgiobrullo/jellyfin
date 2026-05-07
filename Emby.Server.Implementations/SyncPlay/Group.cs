@@ -149,7 +149,8 @@ namespace Emby.Server.Implementations.SyncPlay
                 new GroupMember(session)
                 {
                     Ping = DefaultPing,
-                    IsBuffering = false
+                    IsBuffering = false,
+                    HasAcknowledgedCurrentItem = false
                 });
         }
 
@@ -486,6 +487,30 @@ namespace Emby.Server.Implementations.SyncPlay
         }
 
         /// <inheritdoc />
+        public void SetAcknowledged(SessionInfo session, bool acknowledged)
+        {
+            if (_participants.TryGetValue(session.Id, out GroupMember value))
+            {
+                value.HasAcknowledgedCurrentItem = acknowledged;
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetAllAcknowledged(bool acknowledged)
+        {
+            foreach (var session in _participants.Values)
+            {
+                session.HasAcknowledgedCurrentItem = acknowledged;
+            }
+        }
+
+        /// <inheritdoc />
+        public bool IsAcknowledged(SessionInfo session)
+        {
+            return _participants.TryGetValue(session.Id, out GroupMember value) && value.HasAcknowledgedCurrentItem;
+        }
+
+        /// <inheritdoc />
         public bool SetPlayQueue(IReadOnlyList<Guid> playQueue, int playingItemPosition, long startPositionTicks)
         {
             // Ignore on empty queue or invalid item position.
@@ -507,6 +532,7 @@ namespace Emby.Server.Implementations.SyncPlay
             RunTimeTicks = item.RunTimeTicks ?? 0;
             PositionTicks = startPositionTicks;
             LastActivity = DateTime.UtcNow;
+            SetAllAcknowledged(false);
 
             return true;
         }
@@ -520,6 +546,7 @@ namespace Emby.Server.Implementations.SyncPlay
             {
                 var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
                 RunTimeTicks = item.RunTimeTicks ?? 0;
+                SetAllAcknowledged(false);
             }
             else
             {
@@ -538,6 +565,7 @@ namespace Emby.Server.Implementations.SyncPlay
             if (clearPlayingItem)
             {
                 RestartCurrentItem();
+                SetAllAcknowledged(false);
             }
         }
 
@@ -559,6 +587,7 @@ namespace Emby.Server.Implementations.SyncPlay
                 }
 
                 RestartCurrentItem();
+                SetAllAcknowledged(false);
             }
 
             return playingItemRemoved;
@@ -613,6 +642,7 @@ namespace Emby.Server.Implementations.SyncPlay
                 var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
                 RunTimeTicks = item.RunTimeTicks ?? 0;
                 RestartCurrentItem();
+                SetAllAcknowledged(false);
                 return true;
             }
 
@@ -628,6 +658,7 @@ namespace Emby.Server.Implementations.SyncPlay
                 var item = _libraryManager.GetItemById(PlayQueue.GetPlayingItemId());
                 RunTimeTicks = item.RunTimeTicks ?? 0;
                 RestartCurrentItem();
+                SetAllAcknowledged(false);
                 return true;
             }
 
