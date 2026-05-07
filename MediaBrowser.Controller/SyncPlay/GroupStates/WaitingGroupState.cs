@@ -467,7 +467,19 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
                 // Session is ready.
                 context.SetBuffering(session, false);
-                context.SetAcknowledged(session, true);
+
+                // Only acknowledge sessions whose reported position is genuinely within tolerance
+                // of the group's authoritative position. The got-lost-in-time check above only
+                // catches paused clients (request.IsPlaying == false); a client that reports
+                // IsPlaying == true but with a position far from the group still falls through
+                // to the recovery flow below, and without this guard would also flip the ack
+                // flag — defeating the NextItem/PreviousItem gate for sessions that have not
+                // really loaded the current item (e.g. mpv still on the previous file post-rejoin
+                // when its position happens to align with the group's).
+                if (Math.Abs(delayTicks) <= maxPlaybackOffsetTicks)
+                {
+                    context.SetAcknowledged(session, true);
+                }
 
                 if (context.IsBuffering())
                 {
