@@ -483,8 +483,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     return;
                 }
 
-                // Session is ready.
+                // Session is ready. We're leaving the corrective-Seek branches one way or
+                // another (recovery, transition to Playing, or pause-when-ready), so clear
+                // the inflight flag unconditionally — symmetric with the !ResumePlaying success
+                // path below. Leaving it set would risk suppressing a legitimate correction for
+                // up to 5 s if the group re-entered Waiting (Buffer/Seek) before the safety
+                // timeout expired.
                 context.SetBuffering(session, false);
+                context.SetSeekInflight(session, false);
 
                 // Only acknowledge sessions whose reported position is genuinely within tolerance
                 // of the group's authoritative position. The got-lost-in-time check above only
@@ -497,10 +503,6 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 if (Math.Abs(delayTicks) <= maxPlaybackOffsetTicks)
                 {
                     context.SetAcknowledged(session, true);
-                    // The session is in tolerance so any previously issued corrective Seek
-                    // is presumed to have landed; allow future corrections to be emitted
-                    // without waiting for the safety timeout.
-                    context.SetSeekInflight(session, false);
                 }
 
                 if (context.IsBuffering())
