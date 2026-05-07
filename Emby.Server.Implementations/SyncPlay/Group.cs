@@ -62,6 +62,8 @@ namespace Emby.Server.Implementations.SyncPlay
         /// </summary>
         private IGroupState _state;
 
+        private static readonly TimeSpan SeekInflightTimeout = TimeSpan.FromSeconds(5);
+
         /// <summary>
         /// Initializes a new instance of the <see cref="Group" /> class.
         /// </summary>
@@ -510,8 +512,6 @@ namespace Emby.Server.Implementations.SyncPlay
         {
             return _participants.TryGetValue(session.Id, out GroupMember value) && value.HasAcknowledgedCurrentItem;
         }
-
-        private static readonly TimeSpan SeekInflightTimeout = TimeSpan.FromSeconds(5);
 
         /// <inheritdoc />
         public void SetSeekInflight(SessionInfo session, bool inflight)
