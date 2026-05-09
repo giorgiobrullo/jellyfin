@@ -542,14 +542,35 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                             // negative-delay artifacts. The lagging client takes a hard jump in the
                             // media (skipping ahead by delayTicks) but the group continues with an
                             // accurate authoritative time and no accumulated drift.
-                            var seekCommand = context.NewSyncPlayCommand(SendCommandType.Seek);
-                            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seekCommand, cancellationToken);
-                            context.SetSeekInflight(session, true);
+                            //
+                            // If a previous corrective Seek to this session is still in flight,
+                            // do NOT issue another one — the same suppression rule the per-session
+                            // inflight tracking enforces in the corrective-Seek branches above
+                            // applies here too. Without this guard, two consecutive Ready events
+                            // with large delay would re-fire force-seek (the unconditional
+                            // SetSeekInflight(false) at the top of the Session-is-ready block
+                            // clears the bit each time we re-enter), recreating the storm pattern
+                            // PR #2 exists to suppress.
+                            if (!context.IsSeekInflight(session))
+                            {
+                                // Give the rest of the group a small jitter buffer for the Unpause —
+                                // bounded by ping, never by delayTicks, so no drift accumulates.
+                                var jitterTicks = Math.Max(context.GetHighestPing() * 2, context.DefaultPing) * TimeSpan.TicksPerMillisecond;
+                                context.LastActivity = currentTime.AddTicks(jitterTicks);
 
-                            var unpauseCommand = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                            context.SendCommand(session, SyncPlayBroadcastType.AllGroup, unpauseCommand, cancellationToken);
+                                var seekCommand = context.NewSyncPlayCommand(SendCommandType.Seek);
+                                context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seekCommand, cancellationToken);
+                                context.SetSeekInflight(session, true);
 
-                            _logger.LogWarning("Session {SessionId} is {Delay} seconds behind group {GroupId}; force-seeking to group position instead of stalling the group.", session.Id, TimeSpan.FromTicks(delayTicks).TotalSeconds, context.GroupId.ToString());
+                                var unpauseCommand = context.NewSyncPlayCommand(SendCommandType.Unpause);
+                                context.SendCommand(session, SyncPlayBroadcastType.AllGroup, unpauseCommand, cancellationToken);
+
+                                _logger.LogWarning("Session {SessionId} is {Delay} seconds behind group {GroupId}; capped at {Cap}s, force-seeking to group position instead of stalling the group.", session.Id, TimeSpan.FromTicks(delayTicks).TotalSeconds, context.GroupId.ToString(), MaxRecoveryDelay.TotalSeconds);
+                            }
+                            else
+                            {
+                                _logger.LogDebug("Session {SessionId} is {Delay} seconds behind group {GroupId}; previous force-seek still in flight, not re-issuing.", session.Id, TimeSpan.FromTicks(delayTicks).TotalSeconds, context.GroupId.ToString());
+                            }
                         }
                         else
                         {
