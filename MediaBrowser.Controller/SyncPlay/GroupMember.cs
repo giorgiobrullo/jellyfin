@@ -70,5 +70,30 @@ namespace MediaBrowser.Controller.SyncPlay
         /// actually loaded the new item.
         /// </remarks>
         public bool HasAcknowledgedCurrentItem { get; set; }
+
+        /// <summary>
+        /// Gets or sets a value indicating whether the server has an outstanding Seek correction in flight to this member.
+        /// </summary>
+        /// <remarks>
+        /// Set to <c>true</c> when the server emits a Seek command to this session and clears
+        /// when the session reports a Ready whose position is within tolerance (i.e. the seek
+        /// has landed). While in flight, additional position-mismatched Ready events from this
+        /// session do NOT trigger another Seek — the previous one is presumed to still be
+        /// applying. This is the standard inflight-command pattern and prevents the seek-storm
+        /// behaviour where mpv reports intermediate positions during a seek and the server
+        /// amplifies each report into a fresh corrective Seek, causing A/V desync.
+        /// </remarks>
+        public bool SeekInflight { get; set; }
+
+        /// <summary>
+        /// Gets or sets the UTC time at which the most recent corrective Seek command was issued to this member.
+        /// </summary>
+        /// <remarks>
+        /// Combined with <see cref="SeekInflight"/> to enforce a safety timeout: if a previously
+        /// issued Seek has not been confirmed within a few seconds it is presumed lost (network
+        /// drop, client crash) and the inflight flag is treated as cleared so a fresh Seek can
+        /// be emitted.
+        /// </remarks>
+        public DateTime SeekIssuedAt { get; set; }
     }
 }
