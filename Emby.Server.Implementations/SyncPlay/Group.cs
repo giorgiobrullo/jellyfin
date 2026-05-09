@@ -62,6 +62,8 @@ namespace Emby.Server.Implementations.SyncPlay
         /// </summary>
         private IGroupState _state;
 
+        private static readonly TimeSpan SeekInflightTimeout = TimeSpan.FromSeconds(5);
+
         /// <summary>
         /// Initializes a new instance of the <see cref="Group" /> class.
         /// </summary>
@@ -150,7 +152,8 @@ namespace Emby.Server.Implementations.SyncPlay
                 {
                     Ping = DefaultPing,
                     IsBuffering = false,
-                    HasAcknowledgedCurrentItem = false
+                    HasAcknowledgedCurrentItem = false,
+                    SeekInflight = false
                 });
         }
 
@@ -508,6 +511,51 @@ namespace Emby.Server.Implementations.SyncPlay
         public bool IsAcknowledged(SessionInfo session)
         {
             return _participants.TryGetValue(session.Id, out GroupMember value) && value.HasAcknowledgedCurrentItem;
+        }
+
+        /// <inheritdoc />
+        public void SetSeekInflight(SessionInfo session, bool inflight)
+        {
+            if (_participants.TryGetValue(session.Id, out GroupMember value))
+            {
+                value.SeekInflight = inflight;
+                if (inflight)
+                {
+                    value.SeekIssuedAt = DateTime.UtcNow;
+                }
+            }
+        }
+
+        /// <inheritdoc />
+        public void SetAllSeekInflight(bool inflight)
+        {
+            var now = DateTime.UtcNow;
+            foreach (var member in _participants.Values)
+            {
+                member.SeekInflight = inflight;
+                if (inflight)
+                {
+                    member.SeekIssuedAt = now;
+                }
+            }
+        }
+
+        /// <inheritdoc />
+        public bool IsSeekInflight(SessionInfo session)
+        {
+            if (!_participants.TryGetValue(session.Id, out GroupMember value) || !value.SeekInflight)
+            {
+                return false;
+            }
+
+            if (DateTime.UtcNow - value.SeekIssuedAt > SeekInflightTimeout)
+            {
+                // Previously-issued Seek has not been confirmed within the safety window;
+                // assume lost (network drop, client crash) so a fresh correction can be emitted.
+                return false;
+            }
+
+            return true;
         }
 
         /// <inheritdoc />

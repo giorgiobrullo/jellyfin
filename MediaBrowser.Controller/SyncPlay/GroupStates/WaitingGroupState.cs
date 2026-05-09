@@ -315,6 +315,10 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
 
             // Reset status of sessions and await for all Ready events.
             context.SetAllBuffering(true);
+            // Mark every member as having an inflight Seek so their next position-mismatched
+            // Ready (which will arrive while their player is still seeking) does not get
+            // amplified into a fresh corrective Seek.
+            context.SetAllSeekInflight(true);
 
             // Notify relevant state change event.
             SendGroupStateUpdate(context, request, session, cancellationToken);
@@ -454,9 +458,23 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     // Session not ready at all.
                     context.SetBuffering(session, true);
 
+                    // Suppress duplicate corrective Seek if a previously issued one is still
+                    // presumed to be in flight to this session. The client's player likely
+                    // hasn't finished applying the prior Seek, and re-issuing now is what
+                    // produces the seek-storm symptom (mpv reports intermediate positions
+                    // during the seek, server amplifies each into another Seek, A/V desync).
+                    // SeekInflight self-clears via timeout if confirmation never arrives.
+                    if (context.IsSeekInflight(session))
+                    {
+                        SendGroupStateUpdate(context, request, session, cancellationToken);
+                        _logger.LogDebug("Session {SessionId} still seeking; suppressing duplicate got-lost-in-time correction.", session.Id);
+                        return;
+                    }
+
                     // Correcting session's position.
                     var command = context.NewSyncPlayCommand(SendCommandType.Seek);
                     context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                    context.SetSeekInflight(session, true);
 
                     // Notify relevant state change event.
                     SendGroupStateUpdate(context, request, session, cancellationToken);
@@ -465,8 +483,14 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     return;
                 }
 
-                // Session is ready.
+                // Session is ready. We're leaving the corrective-Seek branches one way or
+                // another (recovery, transition to Playing, or pause-when-ready), so clear
+                // the inflight flag unconditionally — symmetric with the !ResumePlaying success
+                // path below. Leaving it set would risk suppressing a legitimate correction for
+                // up to 5 s if the group re-entered Waiting (Buffer/Seek) before the safety
+                // timeout expired.
                 context.SetBuffering(session, false);
+                context.SetSeekInflight(session, false);
 
                 // Only acknowledge sessions whose reported position is genuinely within tolerance
                 // of the group's authoritative position. The got-lost-in-time check above only
@@ -536,9 +560,20 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                 {
                     // Session still not ready.
                     context.SetBuffering(session, true);
+
+                    // Suppress duplicate corrective Seek while the previous one is in flight;
+                    // see HandleRequest(ReadyGroupRequest) ResumePlaying branch for the rationale.
+                    if (context.IsSeekInflight(session))
+                    {
+                        SendGroupStateUpdate(context, request, session, cancellationToken);
+                        _logger.LogDebug("Session {SessionId} still seeking; suppressing duplicate seeking-to-wrong-position correction.", session.Id);
+                        return;
+                    }
+
                     // Session is seeking to wrong position, correcting.
                     var command = context.NewSyncPlayCommand(SendCommandType.Seek);
                     context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, command, cancellationToken);
+                    context.SetSeekInflight(session, true);
 
                     // Notify relevant state change event.
                     SendGroupStateUpdate(context, request, session, cancellationToken);
@@ -547,9 +582,11 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     return;
                 }
 
-                // Session is ready.
+                // Session is ready. Position has already been verified within tolerance above,
+                // so any previously issued corrective Seek is presumed to have landed.
                 context.SetBuffering(session, false);
                 context.SetAcknowledged(session, true);
+                context.SetSeekInflight(session, false);
 
                 if (!context.IsBuffering())
                 {
