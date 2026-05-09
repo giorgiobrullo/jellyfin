@@ -18,6 +18,16 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
     public class WaitingGroupState : AbstractGroupState
     {
         /// <summary>
+        /// Maximum amount of time the rest of the group is asked to wait for a lagging session
+        /// to catch up before the server gives up and force-seeks the laggard to the group's
+        /// current position instead. Beyond this threshold, future-dating <c>LastActivity</c>
+        /// by <c>delayTicks</c> would compound drift across subsequent state transitions
+        /// (pause/unpause/seek operate on a phantom future time no client is actually at) and
+        /// cause the math to produce nonsensical values like negative delays.
+        /// </summary>
+        private static readonly TimeSpan MaxRecoveryDelay = TimeSpan.FromSeconds(30);
+
+        /// <summary>
         /// The logger.
         /// </summary>
         private readonly ILogger<WaitingGroupState> _logger;
@@ -520,18 +530,42 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     // Let other clients resume as soon as the buffering client catches up.
                     if (delayTicks > context.GetHighestPing() * 2 * TimeSpan.TicksPerMillisecond)
                     {
-                        // Client that was buffering is recovering, notifying others to resume.
-                        context.LastActivity = currentTime.AddTicks(delayTicks);
-                        var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
-                        var filter = SyncPlayBroadcastType.AllExceptCurrentSession;
-                        if (!request.IsPlaying)
+                        if (delayTicks > MaxRecoveryDelay.Ticks)
                         {
-                            filter = SyncPlayBroadcastType.AllGroup;
+                            // Lag exceeds the maximum delay we are willing to ask the rest of the
+                            // group to wait. Force-seek the lagging session to the group's current
+                            // position instead of future-dating LastActivity by delayTicks.
+                            // Future-dating arbitrarily far ahead compounds across pause/unpause/seek
+                            // (the math operates on a phantom time no client actually reaches) and
+                            // produces drift that gets worse with every subsequent operation —
+                            // observed in production as 76s → 117s → 196s widening gaps and
+                            // negative-delay artifacts. The lagging client takes a hard jump in the
+                            // media (skipping ahead by delayTicks) but the group continues with an
+                            // accurate authoritative time and no accumulated drift.
+                            var seekCommand = context.NewSyncPlayCommand(SendCommandType.Seek);
+                            context.SendCommand(session, SyncPlayBroadcastType.CurrentSession, seekCommand, cancellationToken);
+                            context.SetSeekInflight(session, true);
+
+                            var unpauseCommand = context.NewSyncPlayCommand(SendCommandType.Unpause);
+                            context.SendCommand(session, SyncPlayBroadcastType.AllGroup, unpauseCommand, cancellationToken);
+
+                            _logger.LogWarning("Session {SessionId} is {Delay} seconds behind group {GroupId}; force-seeking to group position instead of stalling the group.", session.Id, TimeSpan.FromTicks(delayTicks).TotalSeconds, context.GroupId.ToString());
                         }
+                        else
+                        {
+                            // Client that was buffering is recovering, notifying others to resume.
+                            context.LastActivity = currentTime.AddTicks(delayTicks);
+                            var command = context.NewSyncPlayCommand(SendCommandType.Unpause);
+                            var filter = SyncPlayBroadcastType.AllExceptCurrentSession;
+                            if (!request.IsPlaying)
+                            {
+                                filter = SyncPlayBroadcastType.AllGroup;
+                            }
 
-                        context.SendCommand(session, filter, command, cancellationToken);
+                            context.SendCommand(session, filter, command, cancellationToken);
 
-                        _logger.LogInformation("Session {SessionId} is recovering, group {GroupId} will resume in {Delay} seconds.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
+                            _logger.LogInformation("Session {SessionId} is recovering, group {GroupId} will resume in {Delay} seconds.", session.Id, context.GroupId.ToString(), TimeSpan.FromTicks(delayTicks).TotalSeconds);
+                        }
                     }
                     else
                     {
