@@ -493,26 +493,24 @@ namespace MediaBrowser.Controller.SyncPlay.GroupStates
                     return;
                 }
 
-                // Session is ready. We're leaving the corrective-Seek branches one way or
-                // another (recovery, transition to Playing, or pause-when-ready), so clear
-                // the inflight flag unconditionally — symmetric with the !ResumePlaying success
-                // path below. Leaving it set would risk suppressing a legitimate correction for
-                // up to 5 s if the group re-entered Waiting (Buffer/Seek) before the safety
-                // timeout expired.
+                // Session has reached the "ready" state per the buffering accounting; clear it
+                // even though we may still issue a corrective Seek below if the position is
+                // far enough off.
                 context.SetBuffering(session, false);
-                context.SetSeekInflight(session, false);
 
-                // Only acknowledge sessions whose reported position is genuinely within tolerance
+                // Only acknowledge — and only consider the previously-issued corrective Seek
+                // as having landed — when the reported position is genuinely within tolerance
                 // of the group's authoritative position. The got-lost-in-time check above only
                 // catches paused clients (request.IsPlaying == false); a client that reports
-                // IsPlaying == true but with a position far from the group still falls through
-                // to the recovery flow below, and without this guard would also flip the ack
-                // flag — defeating the NextItem/PreviousItem gate for sessions that have not
-                // really loaded the current item (e.g. mpv still on the previous file post-rejoin
-                // when its position happens to align with the group's).
+                // IsPlaying == true with a position far from the group still falls through to
+                // the recovery flow below. Clearing SeekInflight unconditionally here would
+                // make the Bug 1B force-seek guard further down a no-op, since IsSeekInflight
+                // would always read false by the time control reaches the check — defeating
+                // the storm-suppression PR #2 added.
                 if (Math.Abs(delayTicks) <= maxPlaybackOffsetTicks)
                 {
                     context.SetAcknowledged(session, true);
+                    context.SetSeekInflight(session, false);
                 }
 
                 if (context.IsBuffering())
