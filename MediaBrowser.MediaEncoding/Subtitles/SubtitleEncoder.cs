@@ -1,6 +1,7 @@
 #pragma warning disable CS1591
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
@@ -44,6 +45,11 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         private readonly ISubtitleParser _subtitleParser;
         private readonly IPathManager _pathManager;
         private readonly IServerConfigurationManager _serverConfigurationManager;
+
+        /// <summary>
+        /// Subtitle extractions currently riding along on a remux, by media source id.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Task<bool>> _remuxExtractions = new(StringComparer.Ordinal);
 
         /// <summary>
         /// The _semaphoreLocks.
@@ -572,6 +578,227 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// Extracts a single subtitle track from the media source.
         /// Used to prioritize the selected subtitle for fast availability.
         /// </summary>
+        /// <summary>
+        /// Plans the text subtitle tracks of <paramref name="mediaSource"/> as extra outputs of a
+        /// remux that is about to read the source from its beginning.
+        /// </summary>
+        /// <param name="mediaSource">The media source being remuxed.</param>
+        /// <returns>The plan, or null when there is nothing to gain or it is switched off.</returns>
+        /// <remarks>
+        /// Only tracks ffmpeg can stream-copy are taken: a failing extra output would take the
+        /// playback down with it, so anything needing a conversion stays on the dedicated path.
+        /// Set JELLYFIN_REMUX_SUBTITLE_EXTRACTION to '0' or 'false' to disable.
+        /// </remarks>
+        internal RemuxSubtitlePlan? PlanRemuxExtraction(MediaSourceInfo mediaSource)
+        {
+            var toggle = Environment.GetEnvironmentVariable("JELLYFIN_REMUX_SUBTITLE_EXTRACTION");
+            if (string.Equals(toggle, "0", StringComparison.Ordinal)
+                || string.Equals(toggle, "false", StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+
+            if (string.IsNullOrEmpty(mediaSource.Id) || _remuxExtractions.ContainsKey(mediaSource.Id))
+            {
+                return null;
+            }
+
+            var pending = new List<(MediaStream Stream, int FfmpegIndex, string FinalPath, string Extension)>();
+            foreach (var stream in mediaSource.MediaStreams)
+            {
+                if (stream is not { IsExtractableSubtitleStream: true, SupportsExternalStream: true, IsTextSubtitleStream: true }
+                    || stream.IsExternal
+                    || !IsCodecCopyable(stream.Codec))
+                {
+                    continue;
+                }
+
+                var extension = GetExtractableSubtitleFileExtension(stream);
+                var finalPath = GetSubtitleCachePath(mediaSource, stream.Index, "." + extension);
+                if (finalPath is null || File.Exists(finalPath))
+                {
+                    continue;
+                }
+
+                var ffmpegIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, stream);
+                if (ffmpegIndex == -1)
+                {
+                    continue;
+                }
+
+                pending.Add((stream, ffmpegIndex, finalPath, extension));
+            }
+
+            if (pending.Count == 0)
+            {
+                return null;
+            }
+
+            var cacheDirectory = Path.GetDirectoryName(pending[0].FinalPath);
+            if (string.IsNullOrEmpty(cacheDirectory))
+            {
+                return null;
+            }
+
+            // ffmpeg picks the muxer from the file name, so the temp files keep the real extension.
+            var tempDirectory = Path.Combine(cacheDirectory, "_remux_" + Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture));
+            Directory.CreateDirectory(tempDirectory);
+
+            var arguments = new StringBuilder();
+            var outputs = new List<RemuxSubtitleOutput>(pending.Count);
+            foreach (var (stream, ffmpegIndex, finalPath, extension) in pending)
+            {
+                var tempPath = Path.Combine(tempDirectory, stream.Index.ToString(CultureInfo.InvariantCulture) + "." + extension);
+                arguments.Append(
+                    CultureInfo.InvariantCulture,
+                    $" -map 0:{ffmpegIndex} -an -vn -c:s copy -flush_packets 1 \"{tempPath}\"");
+                outputs.Add(new RemuxSubtitleOutput(stream.Index, tempPath, finalPath));
+            }
+
+            var plan = new RemuxSubtitlePlan
+            {
+                MediaSourceId = mediaSource.Id,
+                Arguments = arguments.ToString(),
+                TempDirectory = tempDirectory,
+                Outputs = outputs,
+                Completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously)
+            };
+
+            if (!_remuxExtractions.TryAdd(mediaSource.Id, plan.Completion.Task))
+            {
+                // Another remux of the same source got there first.
+                TryDeleteDirectory(tempDirectory);
+                return null;
+            }
+
+            _logger.LogInformation(
+                "Extracting {Count} text subtitle tracks alongside the remux of {File}",
+                outputs.Count,
+                mediaSource.Path);
+
+            return plan;
+        }
+
+        /// <summary>
+        /// Moves the subtitle files a remux wrote into the cache, or discards them.
+        /// </summary>
+        /// <param name="plan">The plan returned by <see cref="PlanRemuxExtraction"/>.</param>
+        /// <param name="remuxCompleted">
+        /// Whether ffmpeg read the source to its end. A remux stopped by the user still exits
+        /// with code 0 and leaves subtitle files that look fine and end mid-episode.
+        /// </param>
+        /// <returns>A task.</returns>
+        internal async Task CompleteRemuxExtraction(RemuxSubtitlePlan plan, bool remuxCompleted)
+        {
+            var stored = 0;
+            try
+            {
+                if (remuxCompleted)
+                {
+                    foreach (var output in plan.Outputs)
+                    {
+                        if (!File.Exists(output.TempPath) || _fileSystem.GetFileInfo(output.TempPath).Length == 0)
+                        {
+                            continue;
+                        }
+
+                        using (await _semaphoreLocks.LockAsync(output.FinalPath).ConfigureAwait(false))
+                        {
+                            if (File.Exists(output.FinalPath))
+                            {
+                                continue;
+                            }
+
+                            if (output.TempPath.EndsWith("ass", StringComparison.OrdinalIgnoreCase))
+                            {
+                                await SetAssFont(output.TempPath).ConfigureAwait(false);
+                            }
+
+                            File.Move(output.TempPath, output.FinalPath);
+                            stored++;
+                        }
+                    }
+                }
+
+                _logger.LogInformation(
+                    "Remux subtitle extraction for {MediaSourceId}: remux completed={Completed}, stored {Stored}/{Count} tracks",
+                    plan.MediaSourceId,
+                    remuxCompleted,
+                    stored,
+                    plan.Outputs.Count);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Failed to store subtitles extracted by the remux of {MediaSourceId}", plan.MediaSourceId);
+            }
+            finally
+            {
+                TryDeleteDirectory(plan.TempDirectory);
+                _remuxExtractions.TryRemove(new KeyValuePair<string, Task<bool>>(plan.MediaSourceId, plan.Completion.Task));
+                plan.Completion.TrySetResult(remuxCompleted && stored > 0);
+            }
+        }
+
+        /// <summary>
+        /// Waits for a remux that is already writing the subtitles of this source, so the same
+        /// remote file is not downloaded a second time in parallel. Returns as soon as the wanted
+        /// file is in the cache, the remux gives up, or the wait is no longer worth it; the caller
+        /// then extracts the track itself if it is still missing.
+        /// </summary>
+        private async Task WaitForRemuxExtraction(MediaSourceInfo mediaSource, string outputPath, CancellationToken cancellationToken)
+        {
+            if (string.IsNullOrEmpty(mediaSource.Id) || File.Exists(outputPath))
+            {
+                return;
+            }
+
+            // The player asks for its subtitle at the same moment it asks for the first
+            // segment, and the request that starts the remux may be a beat behind.
+            if (mediaSource.IsRemote)
+            {
+                for (var i = 0; i < 10 && !_remuxExtractions.ContainsKey(mediaSource.Id); i++)
+                {
+                    await Task.Delay(200, cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            if (!_remuxExtractions.TryGetValue(mediaSource.Id, out var remux))
+            {
+                return;
+            }
+
+            _logger.LogInformation("Waiting for the remux to deliver the subtitles of {File}", mediaSource.Path);
+            var waited = Stopwatch.StartNew();
+            try
+            {
+                var stored = await remux.WaitAsync(TimeSpan.FromMinutes(15), cancellationToken).ConfigureAwait(false);
+                _logger.LogInformation(
+                    "Remux {Outcome} the subtitles of {File} after {Time}ms",
+                    stored ? "delivered" : "did not deliver",
+                    mediaSource.Path,
+                    waited.ElapsedMilliseconds);
+            }
+            catch (TimeoutException)
+            {
+                _logger.LogWarning("Gave up waiting for the remux to deliver the subtitles of {File}", mediaSource.Path);
+            }
+        }
+
+        private void TryDeleteDirectory(string path)
+        {
+            try
+            {
+                if (Directory.Exists(path))
+                {
+                    Directory.Delete(path, true);
+                }
+            }
+            catch (IOException ex)
+            {
+                _logger.LogDebug(ex, "Could not remove {Path}", path);
+            }
+        }
+
         private async Task ExtractSingleSubtitle(
             MediaSourceInfo mediaSource,
             MediaStream subtitleStream,
@@ -593,6 +820,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             {
                 return;
             }
+
+            await WaitForRemuxExtraction(mediaSource, outputPath, cancellationToken).ConfigureAwait(false);
 
             var releaser = await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false);
             try
