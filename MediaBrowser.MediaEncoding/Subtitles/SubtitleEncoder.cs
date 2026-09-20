@@ -589,6 +589,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             }
 
             var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + GetExtractableSubtitleFileExtension(subtitleStream));
+            if (outputPath is null)
+            {
+                return;
+            }
 
             var releaser = await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false);
             try
@@ -1059,6 +1063,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     }
 
                     var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + GetExtractableSubtitleFileExtension(subtitleStream));
+                    if (outputPath is null)
+                    {
+                        continue;
+                    }
 
                     var releaser = await _semaphoreLocks.LockAsync(outputPath, cancellationToken).ConfigureAwait(false);
 
