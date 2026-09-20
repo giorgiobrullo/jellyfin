@@ -21,6 +21,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Session;
 using MediaBrowser.Controller.Streaming;
+using MediaBrowser.MediaEncoding.Subtitles;
 using MediaBrowser.Model.Dlna;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
@@ -44,6 +45,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
     private readonly IMediaEncoder _mediaEncoder;
     private readonly IMediaSourceManager _mediaSourceManager;
     private readonly IAttachmentExtractor _attachmentExtractor;
+    private readonly SubtitleEncoder? _subtitleEncoder;
 
     private readonly List<TranscodingJob> _activeTranscodingJobs = new();
     private readonly AsyncKeyedLocker<string> _transcodingLocks = new(o =>
@@ -67,6 +69,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
     /// <param name="mediaEncoder">The <see cref="IMediaEncoder"/>.</param>
     /// <param name="mediaSourceManager">The <see cref="IMediaSourceManager"/>.</param>
     /// <param name="attachmentExtractor">The <see cref="IAttachmentExtractor"/>.</param>
+    /// <param name="subtitleEncoder">The <see cref="ISubtitleEncoder"/>.</param>
     public TranscodeManager(
         ILoggerFactory loggerFactory,
         IFileSystem fileSystem,
@@ -77,7 +80,8 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         EncodingHelper encodingHelper,
         IMediaEncoder mediaEncoder,
         IMediaSourceManager mediaSourceManager,
-        IAttachmentExtractor attachmentExtractor)
+        IAttachmentExtractor attachmentExtractor,
+        ISubtitleEncoder subtitleEncoder)
     {
         _loggerFactory = loggerFactory;
         _fileSystem = fileSystem;
@@ -89,6 +93,7 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         _mediaEncoder = mediaEncoder;
         _mediaSourceManager = mediaSourceManager;
         _attachmentExtractor = attachmentExtractor;
+        _subtitleEncoder = subtitleEncoder as SubtitleEncoder;
 
         _logger = loggerFactory.CreateLogger<TranscodeManager>();
         DeleteEncodedMediaCache();
@@ -485,7 +490,17 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
 
         await logStream.WriteAsync(commandLineLogMessageBytes, cancellationTokenSource.Token).ConfigureAwait(false);
 
-        process.Exited += (_, _) => OnFfMpegProcessExited(process, transcodingJob, state);
+        // Planned last: from here to Start() nothing awaits, so a plan is never left registered
+        // (with subtitle requests waiting on it) for a remux that did not get to run.
+        var remuxSubtitlePlan = PlanRemuxSubtitleExtraction(state, transcodingJobType);
+        if (remuxSubtitlePlan is not null)
+        {
+            process.StartInfo.Arguments += remuxSubtitlePlan.Arguments;
+            _logger.LogInformation("Remux subtitle outputs:{Arguments}", remuxSubtitlePlan.Arguments);
+            logStream.Write(Encoding.UTF8.GetBytes("Remux subtitle outputs appended to the command above:" + remuxSubtitlePlan.Arguments + Environment.NewLine + Environment.NewLine));
+        }
+
+        process.Exited += (_, _) => OnFfMpegProcessExited(process, transcodingJob, state, remuxSubtitlePlan);
 
         try
         {
@@ -495,6 +510,11 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         {
             _logger.LogError(ex, "Error starting FFmpeg");
             OnTranscodeFailedToStart(outputPath, transcodingJobType, state);
+
+            if (remuxSubtitlePlan is not null)
+            {
+                _ = _subtitleEncoder!.CompleteRemuxExtraction(remuxSubtitlePlan, false);
+            }
 
             throw;
         }
@@ -538,6 +558,42 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         _logger.LogDebug("StartFfMpeg() finished successfully");
 
         return transcodingJob;
+    }
+
+    /// <summary>
+    /// Has the remux write the source's text subtitle tracks too, when it is going to read the
+    /// whole source anyway.
+    /// </summary>
+    /// <remarks>
+    /// Limited to the case where it is a clear win and cannot slow playback down: a remote
+    /// source (where a separate extraction is a second full download), video being copied (an
+    /// encode would pace the subtitles at the encoder's speed), and a start at the very
+    /// beginning (a seeked remux skips the earlier subtitle packets).
+    /// </remarks>
+    private RemuxSubtitlePlan? PlanRemuxSubtitleExtraction(StreamState state, TranscodingJobType transcodingJobType)
+    {
+        if (_subtitleEncoder is null
+            || transcodingJobType != TranscodingJobType.Hls
+            || !state.IsInputVideo
+            || state.VideoRequest is null
+            || !EncodingHelper.IsCopyCodec(state.OutputVideoCodec)
+            || state.MediaSource is not { IsRemote: true }
+            || !state.RunTimeTicks.HasValue
+            || (state.BaseRequest.StartTimeTicks ?? 0) > 0)
+        {
+            return null;
+        }
+
+        try
+        {
+            return _subtitleEncoder.PlanRemuxExtraction(state.MediaSource);
+        }
+        catch (Exception ex)
+        {
+            // Never let this optimisation get in the way of playback.
+            _logger.LogWarning(ex, "Could not plan subtitle extraction alongside the remux");
+            return null;
+        }
     }
 
     private void StartThrottler(StreamState state, TranscodingJob transcodingJob)
@@ -638,10 +694,18 @@ public sealed class TranscodeManager : ITranscodeManager, IDisposable
         }
     }
 
-    private void OnFfMpegProcessExited(Process process, TranscodingJob job, StreamState state)
+    private void OnFfMpegProcessExited(Process process, TranscodingJob job, StreamState state, RemuxSubtitlePlan? remuxSubtitlePlan)
     {
         job.HasExited = true;
         job.ExitCode = process.ExitCode;
+
+        if (remuxSubtitlePlan is not null)
+        {
+            // A job stopped by the player is cancelled before ffmpeg is told to quit, and ffmpeg
+            // then still exits with 0: only an uncancelled clean exit read the whole source.
+            var readWholeSource = process.ExitCode == 0 && job.CancellationTokenSource?.IsCancellationRequested != true;
+            _ = _subtitleEncoder!.CompleteRemuxExtraction(remuxSubtitlePlan, readWholeSource);
+        }
 
         ReportTranscodingProgress(job, state, null, null, null, null, null);
 
