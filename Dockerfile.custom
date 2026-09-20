@@ -1,7 +1,11 @@
-FROM mcr.microsoft.com/dotnet/sdk:9.0 AS build
+FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY . .
 RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build
 
-FROM ghcr.io/hotio/jellyfin:release
+# The patched assembly replaces the stock one, so it has to be built from the
+# exact Jellyfin release the base image ships. This branch sits on v12.1 and
+# the digest below is hotio's `release` tag at 12.1 (2026-09-17): bump both
+# together, never one without the other.
+FROM ghcr.io/hotio/jellyfin:release@sha256:520070e545f84032f2331f1b40f5c85fab151adcbbf7446dc045e2c64e7ed162
 COPY --from=build /build/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
