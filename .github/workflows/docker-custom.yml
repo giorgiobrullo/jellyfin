@@ -2,7 +2,7 @@ name: Build Custom Jellyfin
 
 on:
   push:
-    branches: [custom-patches]
+    branches: [custom-patches, custom-patches-12]
   workflow_dispatch:
 
 env:
@@ -30,4 +30,5 @@ jobs:
           context: .
           file: Dockerfile.custom
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:custom
+          # custom-patches (Jellyfin 10.11) keeps :custom, the Jellyfin 12 branch gets its own tag
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.ref_name == 'custom-patches-12' && 'custom-12' || 'custom' }}
