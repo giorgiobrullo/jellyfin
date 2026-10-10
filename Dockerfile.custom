@@ -1,11 +1,19 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY . .
-RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build
+# Every assembly this branch patches, each built into its own directory: an assembly the image
+# does not replace runs the stock code, whatever the branch says (the search fix in Jellyfin.Api
+# and the session manager registration the subtitle extraction needs were both missing so).
+RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build/encoding \
+ && dotnet build Emby.Server.Implementations/Emby.Server.Implementations.csproj -c Release -o /build/implementations \
+ && dotnet build Jellyfin.Api/Jellyfin.Api.csproj -c Release -o /build/api
 
-# The patched assembly replaces the stock one, so it has to be built from the
+# The patched assemblies replace the stock ones, so they have to be built from the
 # exact Jellyfin release the base image ships. This branch sits on v12.2 and
 # the digest below is hotio's `release` tag at 12.2 (2026-10-08): bump both
-# together, never one without the other.
+# together, never one without the other. A new patch in another project needs
+# its assembly added here.
 FROM ghcr.io/hotio/jellyfin:release@sha256:f267a94bc66983073f20b9765291dd0f72b48f49aac9bc08ccda778079d57a9c
-COPY --from=build /build/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
+COPY --from=build /build/encoding/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
+COPY --from=build /build/implementations/Emby.Server.Implementations.dll /usr/lib/jellyfin/bin/Emby.Server.Implementations.dll
+COPY --from=build /build/api/Jellyfin.Api.dll /usr/lib/jellyfin/bin/Jellyfin.Api.dll
