@@ -23,6 +23,7 @@ using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.IO;
 using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
+using MediaBrowser.Controller.Session;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
@@ -37,6 +38,17 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 {
     public sealed class SubtitleEncoder : ISubtitleEncoder, IDisposable
     {
+        /// <summary>
+        /// Time ranges a long source is split into for parallel extraction. Four connections fill
+        /// a ~650 Mbit/s pipe from a debrid CDN already; more only divide the same bandwidth.
+        /// </summary>
+        private const int ParallelChunks = 4;
+
+        /// <summary>
+        /// Seconds neighbouring chunks overlap, so an event straddling a boundary is not lost.
+        /// </summary>
+        private const double ParallelChunkOverlapSeconds = 20;
+
         private readonly ILogger<SubtitleEncoder> _logger;
         private readonly IFileSystem _fileSystem;
         private readonly IMediaEncoder _mediaEncoder;
@@ -50,6 +62,13 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// Subtitle extractions currently riding along on a remux, by media source id.
         /// </summary>
         private readonly ConcurrentDictionary<string, Task<bool>> _remuxExtractions = new(StringComparer.Ordinal);
+
+        /// <summary>
+        /// Passes extracting every text subtitle track of a source at once, by media source id.
+        /// </summary>
+        private readonly ConcurrentDictionary<string, Lazy<Task>> _textTrackPasses = new(StringComparer.Ordinal);
+
+        private readonly Lazy<ISessionManager> _sessionManager;
 
         /// <summary>
         /// The _semaphoreLocks.
@@ -68,7 +87,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             IMediaSourceManager mediaSourceManager,
             ISubtitleParser subtitleParser,
             IPathManager pathManager,
-            IServerConfigurationManager serverConfigurationManager)
+            IServerConfigurationManager serverConfigurationManager,
+            Lazy<ISessionManager> sessionManager)
         {
             _logger = logger;
             _fileSystem = fileSystem;
@@ -78,6 +98,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             _subtitleParser = subtitleParser;
             _pathManager = pathManager;
             _serverConfigurationManager = serverConfigurationManager;
+            _sessionManager = sessionManager;
         }
 
         internal MemoryStream ConvertSubtitles(
@@ -213,9 +234,15 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         {
             if (!subtitleStream.IsExternal || subtitleStream.Path.EndsWith(".mks", StringComparison.OrdinalIgnoreCase))
             {
-                // Extract the requested track first for fast availability,
-                // then lazily extract remaining tracks in the background.
-                await ExtractSingleSubtitle(mediaSource, subtitleStream, cancellationToken).ConfigureAwait(false);
+                // A text track of a long source comes out of one parallel pass together with every
+                // other text track, so the source is read once and switching tracks costs nothing.
+                // Anything that pass does not cover keeps the old order: the requested track first
+                // for fast availability, then the remaining tracks lazily in the background.
+                if (!await ExtractTextTracksTogether(mediaSource, subtitleStream, cancellationToken).ConfigureAwait(false))
+                {
+                    await ExtractSingleSubtitle(mediaSource, subtitleStream, cancellationToken).ConfigureAwait(false);
+                }
+
                 _ = Task.Run(() => ExtractRemainingSubtitlesAsync(mediaSource, subtitleStream.Index), CancellationToken.None);
 
                 var outputFileExtension = GetExtractableSubtitleFileExtension(subtitleStream);
@@ -939,6 +966,326 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             }
         }
 
+        private static bool IsParallelExtractionEnabled()
+        {
+            var value = Environment.GetEnvironmentVariable("JELLYFIN_PARALLEL_SUBTITLE_EXTRACTION");
+            return !string.Equals(value, "0", StringComparison.Ordinal)
+                && !string.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
+        }
+
+        /// <summary>
+        /// The text tracks a single pass can extract from <paramref name="mediaSource"/>: embedded,
+        /// written as ASS or SRT (the formats the chunk merge understands) and not cached yet.
+        /// </summary>
+        internal IReadOnlyList<TextTrackOutput> GetTextTracksForPass(MediaSourceInfo mediaSource)
+        {
+            var tracks = new List<TextTrackOutput>();
+            foreach (var stream in mediaSource.MediaStreams)
+            {
+                if (stream.Type != MediaStreamType.Subtitle
+                    || stream.IsExternal
+                    || !stream.IsTextSubtitleStream
+                    || !stream.IsExtractableSubtitleStream
+                    || !stream.SupportsExternalStream)
+                {
+                    continue;
+                }
+
+                var extension = GetExtractableSubtitleFileExtension(stream);
+                var codec = IsCodecCopyable(stream.Codec) ? "copy" : "srt";
+                var format = string.Equals(codec, "copy", StringComparison.Ordinal) ? extension.ToLowerInvariant() : codec;
+                if (format is not ("ass" or "srt"))
+                {
+                    continue;
+                }
+
+                var ffmpegIndex = EncodingHelper.FindIndex(mediaSource.MediaStreams, stream);
+                var outputPath = GetSubtitleCachePath(mediaSource, stream.Index, "." + extension);
+                if (ffmpegIndex == -1 || outputPath is null || File.Exists(outputPath))
+                {
+                    continue;
+                }
+
+                tracks.Add(new TextTrackOutput(stream.Index, ffmpegIndex, codec, format, outputPath));
+            }
+
+            return tracks;
+        }
+
+        /// <summary>
+        /// The ffmpeg arguments for one chunk of a text track pass: one input seek and one output per track.
+        /// </summary>
+        internal static string BuildTextTrackChunkArguments(
+            string inputPath,
+            double start,
+            double end,
+            IEnumerable<(int FfmpegIndex, string Codec, string ChunkPath)> outputs)
+        {
+            // -ss before -i is an input seek (HTTP range requests on the container index);
+            // -copyts keeps absolute timestamps so events line up across chunks.
+            var args = new StringBuilder();
+            args.Append(CultureInfo.InvariantCulture, $"-ss {start:F3} -to {end:F3} -i {inputPath} -copyts");
+            foreach (var (ffmpegIndex, codec, chunkPath) in outputs)
+            {
+                args.Append(CultureInfo.InvariantCulture, $" -map 0:{ffmpegIndex} -an -vn -c:s {codec} -flush_packets 1 \"{chunkPath}\"");
+            }
+
+            return args.ToString();
+        }
+
+        /// <summary>
+        /// Extracts <paramref name="subtitleStream"/> through the text track pass of its source,
+        /// starting that pass if none is running.
+        /// </summary>
+        /// <remarks>
+        /// Pulling one track out of a container means reading all of it, and for a remote source
+        /// that read is the whole cost: measured against a debrid CDN, 4 connections already fill a
+        /// ~650 Mbit/s pipe, so more chunks would not help, but reading the source once per track
+        /// did hurt. A direct-played episode with a wrong first guess was downloaded three times
+        /// (the first track, the one switched to while the first was still running, and the
+        /// background pass for the rest, linear and 2m20s long) and its subtitles took 54s. One
+        /// pass writes every text track: the source is read once, a track switched to while it
+        /// runs is already part of it, and later switches are cache hits.
+        /// </remarks>
+        /// <returns><c>true</c> when the requested track is in the cache afterwards; <c>false</c>
+        /// when the pass does not cover it, and the caller extracts it the old way.</returns>
+        private async Task<bool> ExtractTextTracksTogether(MediaSourceInfo mediaSource, MediaStream subtitleStream, CancellationToken cancellationToken)
+        {
+            var durationSeconds = mediaSource.RunTimeTicks.HasValue
+                ? mediaSource.RunTimeTicks.Value / (double)TimeSpan.TicksPerSecond
+                : 0;
+            if (subtitleStream.IsExternal
+                || !subtitleStream.IsTextSubtitleStream
+                || string.IsNullOrEmpty(mediaSource.Id)
+                || durationSeconds < 600
+                || !IsParallelExtractionEnabled())
+            {
+                return false;
+            }
+
+            var outputPath = GetSubtitleCachePath(mediaSource, subtitleStream.Index, "." + GetExtractableSubtitleFileExtension(subtitleStream));
+            if (outputPath is null)
+            {
+                return false;
+            }
+
+            // A remux that copies the source from its start writes these tracks already.
+            await WaitForRemuxExtraction(mediaSource, outputPath, cancellationToken).ConfigureAwait(false);
+            if (File.Exists(outputPath))
+            {
+                return true;
+            }
+
+            // Every eligible track that is not cached yet is in the list, so a track missing from it is
+            // one the pass cannot write (SSA, say), whether or not a pass is running.
+            var tracks = GetTextTracksForPass(mediaSource);
+            if (!tracks.Any(t => t.StreamIndex == subtitleStream.Index))
+            {
+                return false;
+            }
+
+            var created = new Lazy<Task>(() => RunTextTrackPass(mediaSource, tracks, durationSeconds));
+            var pass = _textTrackPasses.GetOrAdd(mediaSource.Id, created);
+            if (ReferenceEquals(pass, created))
+            {
+                _ = pass.Value.ContinueWith(
+                    _ => _textTrackPasses.TryRemove(KeyValuePair.Create(mediaSource.Id, created)),
+                    CancellationToken.None,
+                    TaskContinuationOptions.ExecuteSynchronously,
+                    TaskScheduler.Default);
+            }
+
+            try
+            {
+                await pass.Value.WaitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException)
+            {
+                _logger.LogWarning(ex, "Text subtitle track pass failed for {File}", mediaSource.Path);
+            }
+
+            return File.Exists(outputPath);
+        }
+
+        /// <summary>
+        /// Splits the source into chunks and extracts every track in <paramref name="candidates"/>
+        /// from each chunk with one ffmpeg, then merges each track's chunks into its cache file.
+        /// A track missing afterwards is left to the single-track path.
+        /// </summary>
+        private async Task RunTextTrackPass(MediaSourceInfo mediaSource, IReadOnlyList<TextTrackOutput> candidates, double durationSeconds)
+        {
+            var locks = new List<IDisposable>();
+            var tracks = new List<TextTrackOutput>();
+            using var stop = new CancellationTokenSource();
+            using var finished = new CancellationTokenSource();
+            var watchdog = Task.CompletedTask;
+            string? tempDir = null;
+            var elapsed = Stopwatch.StartNew();
+
+            try
+            {
+                foreach (var track in candidates)
+                {
+                    var releaser = await _semaphoreLocks.LockAsync(track.OutputPath).ConfigureAwait(false);
+                    if (File.Exists(track.OutputPath))
+                    {
+                        releaser.Dispose();
+                        continue;
+                    }
+
+                    locks.Add(releaser);
+                    tracks.Add(track);
+                }
+
+                if (tracks.Count == 0)
+                {
+                    return;
+                }
+
+                watchdog = StopWhenNobodyWatches(mediaSource, stop, finished.Token);
+
+                var inputPath = _mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource);
+                var cacheDir = Path.GetDirectoryName(tracks[0].OutputPath) ?? throw new InvalidOperationException($"Invalid subtitle cache path {tracks[0].OutputPath}");
+                tempDir = Path.Combine(cacheDir, $"_pass_{Guid.NewGuid():N}");
+                Directory.CreateDirectory(tempDir);
+
+                string ChunkPath(int chunk, TextTrackOutput track) => Path.Combine(tempDir, $"chunk_{chunk}_{track.StreamIndex}.{track.Format}");
+
+                _logger.LogInformation(
+                    "Extracting {Count} text subtitle tracks ({Tracks}) in one parallel pass for {File}",
+                    tracks.Count,
+                    string.Join(", ", tracks.Select(t => t.StreamIndex)),
+                    mediaSource.Path);
+
+                var chunkSize = durationSeconds / ParallelChunks;
+                var chunks = new List<Task<(int ExitCode, string StandardError)>>();
+                for (var i = 0; i < ParallelChunks; i++)
+                {
+                    var rawStart = i * chunkSize;
+                    var rawEnd = (i == ParallelChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
+                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : ParallelChunkOverlapSeconds));
+                    var end = Math.Min(durationSeconds, rawEnd + ParallelChunkOverlapSeconds);
+                    var chunk = i;
+                    var args = BuildTextTrackChunkArguments(inputPath, start, end, tracks.Select(t => (t.FfmpegIndex, t.Codec, ChunkPath(chunk, t))));
+                    chunks.Add(RunSubtitleExtractionProcess(args, stop.Token));
+                }
+
+                var results = await Task.WhenAll(chunks).ConfigureAwait(false);
+                if (stop.IsCancellationRequested)
+                {
+                    _logger.LogInformation("Stopped the text subtitle track pass for {File}: nobody is watching it any more", mediaSource.Path);
+                    return;
+                }
+
+                // Only a clean run of every chunk means each track's chunks cover the whole source;
+                // a chunk that timed out or failed leaves its tracks to the single-track path.
+                var failed = results.Where(r => r.ExitCode != 0).ToList();
+                if (failed.Count > 0)
+                {
+                    _logger.LogWarning("Text subtitle track pass failed for {File}: {FfmpegOutput}", mediaSource.Path, failed[0].StandardError);
+                    return;
+                }
+
+                var stored = 0;
+                foreach (var track in tracks)
+                {
+                    var chunkPaths = Enumerable.Range(0, ParallelChunks).Select(i => ChunkPath(i, track)).ToList();
+                    if (!chunkPaths.Any(p => File.Exists(p) && new FileInfo(p).Length > 0))
+                    {
+                        continue;
+                    }
+
+                    var partial = track.OutputPath + ".partial";
+                    try
+                    {
+                        if (string.Equals(track.Format, "ass", StringComparison.Ordinal))
+                        {
+                            MergeAssChunks(chunkPaths, partial);
+                        }
+                        else
+                        {
+                            MergeSrtChunks(chunkPaths, partial);
+                        }
+
+                        File.Move(partial, track.OutputPath, true);
+                        if (string.Equals(track.Format, "ass", StringComparison.Ordinal))
+                        {
+                            await SetAssFont(track.OutputPath).ConfigureAwait(false);
+                        }
+
+                        stored++;
+                    }
+                    catch (Exception ex) when (ex is IOException or InvalidOperationException)
+                    {
+                        _logger.LogWarning(ex, "Could not merge subtitle track {Index} of {File}", track.StreamIndex, mediaSource.Path);
+                        try
+                        {
+                            _fileSystem.DeleteFile(partial);
+                        }
+                        catch (IOException)
+                        {
+                        }
+                    }
+                }
+
+                _logger.LogInformation(
+                    "Extracted {Stored} of {Count} text subtitle tracks in one parallel pass in {Time}ms for {File}",
+                    stored,
+                    tracks.Count,
+                    elapsed.ElapsedMilliseconds,
+                    mediaSource.Path);
+            }
+            finally
+            {
+                await finished.CancelAsync().ConfigureAwait(false);
+                await watchdog.ConfigureAwait(false);
+                locks.ForEach(x => x.Dispose());
+                if (tempDir is not null)
+                {
+                    TryDeleteDirectory(tempDir);
+                }
+            }
+        }
+
+        /// <summary>
+        /// Cancels <paramref name="stop"/> once nobody has watched the source for two checks in a row.
+        /// </summary>
+        /// <remarks>
+        /// Every session counts, so a SyncPlay group or two people on the same episode keep the pass
+        /// going for as long as any of them plays it. It only arms after it has seen someone play
+        /// the source: a request that does not come from a player is never cut short.
+        /// </remarks>
+        private async Task StopWhenNobodyWatches(MediaSourceInfo mediaSource, CancellationTokenSource stop, CancellationToken finished)
+        {
+            var seenViewer = false;
+            var idleChecks = 0;
+            try
+            {
+                while (true)
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(15), finished).ConfigureAwait(false);
+                    if (IsSourceBeingWatched(mediaSource.Id))
+                    {
+                        seenViewer = true;
+                        idleChecks = 0;
+                    }
+                    else if (seenViewer && ++idleChecks >= 2)
+                    {
+                        await stop.CancelAsync().ConfigureAwait(false);
+                        return;
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // The pass is over.
+            }
+        }
+
+        internal bool IsSourceBeingWatched(string mediaSourceId)
+            => _sessionManager.Value.Sessions.Any(s => s.NowPlayingItem is not null
+                && string.Equals(s.PlayState?.MediaSourceId, mediaSourceId, StringComparison.OrdinalIgnoreCase));
+
         /// <summary>
         /// Splits the source into N time ranges and extracts each in parallel via -ss/-to,
         /// then merges the ASS/SRT outputs. Designed for slow HTTP sources where a single
@@ -953,9 +1300,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             string format,
             CancellationToken cancellationToken)
         {
-            const int numChunks = 4;
-            const double overlapSeconds = 20;
-            var chunkSize = durationSeconds / numChunks;
+            var chunkSize = durationSeconds / ParallelChunks;
 
             var outputDir = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException("Invalid output path", nameof(outputPath));
             var baseName = Path.GetFileNameWithoutExtension(outputPath);
@@ -967,12 +1312,12 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
             try
             {
-                for (var i = 0; i < numChunks; i++)
+                for (var i = 0; i < ParallelChunks; i++)
                 {
                     var rawStart = i * chunkSize;
-                    var rawEnd = (i == numChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
-                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : overlapSeconds));
-                    var end = Math.Min(durationSeconds, rawEnd + overlapSeconds);
+                    var rawEnd = (i == ParallelChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
+                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : ParallelChunkOverlapSeconds));
+                    var end = Math.Min(durationSeconds, rawEnd + ParallelChunkOverlapSeconds);
                     var chunkPath = Path.Combine(tempDir, $"chunk_{i}.{format}");
                     chunkPaths.Add(chunkPath);
 
