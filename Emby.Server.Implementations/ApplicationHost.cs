@@ -574,6 +574,7 @@ namespace Emby.Server.Implementations
             serviceCollection.AddTransient(provider => new Lazy<IProviderManager>(provider.GetRequiredService<IProviderManager>));
             serviceCollection.AddTransient(provider => new Lazy<IUserViewManager>(provider.GetRequiredService<IUserViewManager>));
             serviceCollection.AddTransient(provider => new Lazy<IExternalDataManager>(provider.GetRequiredService<IExternalDataManager>));
+            serviceCollection.AddTransient(provider => new Lazy<ISessionManager>(provider.GetRequiredService<ISessionManager>));
             serviceCollection.AddSingleton<ILibraryManager, LibraryManager>();
             serviceCollection.AddSingleton<NamingOptions>();
             serviceCollection.AddSingleton<VideoListResolver>();
