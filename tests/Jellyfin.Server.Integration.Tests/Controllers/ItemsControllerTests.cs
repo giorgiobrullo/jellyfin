@@ -60,4 +60,23 @@ public sealed class ItemsControllerTests : IClassFixture<JellyfinApplicationFact
         var items = await response.Content.ReadFromJsonAsync<QueryResult<BaseItemDto>>(_jsonOptions, TestContext.Current.CancellationToken);
         Assert.NotNull(items);
     }
+
+    [Theory]
+    [InlineData("Items?userId={0}&recursive=true&searchTerm=zzqxv")]
+    [InlineData("Items?userId={0}&recursive=true&searchTerm=zzqxv&includeItemTypes=Movie&includeItemTypes=Series&limit=24")]
+    [InlineData("Items?userId={0}&recursive=true&searchTerm=%21%21%21")]
+    public async Task GetItems_SearchTermWithoutMatches_EmptyResult(string format)
+    {
+        var client = _factory.CreateClient();
+        client.DefaultRequestHeaders.AddAuthHeader(_accessToken ??= await AuthHelper.CompleteStartupAsync(client));
+
+        var userDto = await AuthHelper.GetUserDtoAsync(client);
+
+        var response = await client.GetAsync(string.Format(CultureInfo.InvariantCulture, format, userDto.Id), TestContext.Current.CancellationToken);
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+        var items = await response.Content.ReadFromJsonAsync<QueryResult<BaseItemDto>>(_jsonOptions, TestContext.Current.CancellationToken);
+        Assert.NotNull(items);
+        Assert.Empty(items.Items);
+        Assert.Equal(0, items.TotalRecordCount);
+    }
 }

@@ -376,6 +376,16 @@ public class ItemsController : BaseJellyfinApiController
                     ? ids.Concat(searchResultScores.Keys).Distinct().ToArray()
                     : searchResultScores.Keys.ToArray();
             }
+            else if (ids.Length == 0)
+            {
+                // The providers found nothing. Falling through searched again through the item
+                // query's SearchTerm filter, which matches a subset of what the database provider
+                // does (its wildcard branch never runs: the term is cleaned of punctuation first),
+                // so its answer was empty as well, after 150 to 250 ms on a library of 80,000
+                // items. That was every search for a title the library does not hold, and the web
+                // client's "everything else" search for most terms.
+                return new QueryResult<BaseItemDto>(startIndex, 0, []);
+            }
         }
 
         var query = new InternalItemsQuery(user)
