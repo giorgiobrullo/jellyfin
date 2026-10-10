@@ -6,13 +6,17 @@ COPY . .
 # and the session manager registration the subtitle extraction needs were both missing so).
 RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c Release -o /build/encoding \
  && dotnet build Emby.Server.Implementations/Emby.Server.Implementations.csproj -c Release -o /build/implementations \
- && dotnet build Jellyfin.Api/Jellyfin.Api.csproj -c Release -o /build/api
+ && dotnet build Jellyfin.Api/Jellyfin.Api.csproj -c Release -o /build/api -p:Version=24.4.0.0
 
 # The patched assemblies replace the stock ones, so they have to be built from the
 # exact Jellyfin release the base image ships. This branch sits on v12.2 and
 # the digest below is hotio's `release` tag at 12.2 (2026-10-08): bump both
 # together, never one without the other. A new patch in another project needs
-# its assembly added here.
+# its assembly added here. Jellyfin.Api does not compile SharedVersion.cs: the
+# release build gives it its own version (24.4.0.0 in 12.2, see the stock DLL's
+# version resource) and the other assemblies reference that one, so it has to be
+# built with it or the server does not start (FileNotFoundException at startup).
+# Test a new image with `docker run` before it replaces the running one.
 FROM ghcr.io/hotio/jellyfin:release@sha256:f267a94bc66983073f20b9765291dd0f72b48f49aac9bc08ccda778079d57a9c
 COPY --from=build /build/encoding/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
 COPY --from=build /build/implementations/Emby.Server.Implementations.dll /usr/lib/jellyfin/bin/Emby.Server.Implementations.dll
