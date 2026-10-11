@@ -128,6 +128,25 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         }
 
         /// <summary>
+        /// Starts reading a track before anyone asks for it, so the first events are there when
+        /// the player does (it asks once the video has started, a second or two later).
+        /// </summary>
+        /// <param name="mediaSource">The media source holding the track.</param>
+        /// <param name="streamIndex">The subtitle stream index.</param>
+        /// <param name="startSeconds">Where the player will ask from.</param>
+        public void Prefetch(MediaSourceInfo mediaSource, int streamIndex, double startSeconds)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            ArgumentNullException.ThrowIfNull(mediaSource);
+
+            var session = GetOrStartSession(mediaSource, streamIndex, Math.Max(0, startSeconds), null);
+            lock (session.Sync)
+            {
+                session.LastAccess = DateTime.UtcNow;
+            }
+        }
+
+        /// <summary>
         /// Parses the start time of a <c>Dialogue:</c> or <c>Comment:</c> line.
         /// </summary>
         /// <param name="line">The event line.</param>
@@ -182,12 +201,14 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         {
             // -ss before -i seeks through the container index, so only the part of the file from the
             // start position onwards is read; -copyts keeps the original event times.
+            // No stream analysis: the track's codec data is in the Matroska header, and probing the
+            // audio and video read another ~5 MB (about a second) before the first event.
             var seek = startSeconds > 0
                 ? string.Create(CultureInfo.InvariantCulture, $"-ss {startSeconds:F3} ")
                 : string.Empty;
             return string.Create(
                 CultureInfo.InvariantCulture,
-                $"-nostdin -hide_banner -loglevel error {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s copy -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
+                $"-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s copy -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
         }
 
         private Session GetOrStartSession(MediaSourceInfo mediaSource, int streamIndex, double startSeconds, string? sessionId)
