@@ -22,6 +22,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Controller.Subtitles;
+using MediaBrowser.MediaEncoding.Subtitles;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
 using MediaBrowser.Model.Net;
@@ -48,6 +49,7 @@ public class SubtitleController : BaseJellyfinApiController
     private readonly IProviderManager _providerManager;
     private readonly IFileSystem _fileSystem;
     private readonly ILogger<SubtitleController> _logger;
+    private readonly ProgressiveSubtitleExtractor _progressiveSubtitleExtractor;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="SubtitleController"/> class.
@@ -60,6 +62,7 @@ public class SubtitleController : BaseJellyfinApiController
     /// <param name="providerManager">Instance of <see cref="IProviderManager"/> interface.</param>
     /// <param name="fileSystem">Instance of <see cref="IFileSystem"/> interface.</param>
     /// <param name="logger">Instance of <see cref="ILogger{SubtitleController}"/> interface.</param>
+    /// <param name="progressiveSubtitleExtractor">Instance of the <see cref="ProgressiveSubtitleExtractor"/>.</param>
     public SubtitleController(
         IServerConfigurationManager serverConfigurationManager,
         ILibraryManager libraryManager,
@@ -68,7 +71,8 @@ public class SubtitleController : BaseJellyfinApiController
         IMediaSourceManager mediaSourceManager,
         IProviderManager providerManager,
         IFileSystem fileSystem,
-        ILogger<SubtitleController> logger)
+        ILogger<SubtitleController> logger,
+        ProgressiveSubtitleExtractor progressiveSubtitleExtractor)
     {
         _serverConfigurationManager = serverConfigurationManager;
         _libraryManager = libraryManager;
@@ -78,6 +82,7 @@ public class SubtitleController : BaseJellyfinApiController
         _providerManager = providerManager;
         _fileSystem = fileSystem;
         _logger = logger;
+        _progressiveSubtitleExtractor = progressiveSubtitleExtractor;
     }
 
     /// <summary>
@@ -271,6 +276,82 @@ public class SubtitleController : BaseJellyfinApiController
                 endPositionTicks,
                 copyTimestamps).ConfigureAwait(false),
             MimeTypes.GetMimeType("file." + format));
+    }
+
+    /// <summary>
+    /// Streams an embedded ASS/SSA track while it is read from the source.
+    /// </summary>
+    /// <remarks>
+    /// A full extraction of a remote file downloads all of it before returning anything. This reads
+    /// from the given position and hands out the events found so far, so a player can start with the
+    /// lines around the playback position within seconds and poll for the rest.
+    /// </remarks>
+    /// <param name="itemId">The item id.</param>
+    /// <param name="mediaSourceId">The media source id.</param>
+    /// <param name="index">The subtitle stream index.</param>
+    /// <param name="startPositionTicks">Where to start reading when a new extraction is needed.</param>
+    /// <param name="session">The extraction the client is following, from a previous reply.</param>
+    /// <param name="since">The number of events the client already has from that extraction.</param>
+    /// <param name="waitMs">How long to wait for new events before replying, at most 10000.</param>
+    /// <response code="200">Events returned.</response>
+    /// <response code="400">The track is not an embedded ASS/SSA track.</response>
+    /// <response code="404">Item, media source or track not found.</response>
+    /// <returns>The <see cref="ProgressiveSubtitleDto"/>.</returns>
+    [HttpGet("Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Progressive")]
+    [Authorize]
+    [ProducesResponseType(StatusCodes.Status200OK)]
+    [ProducesResponseType(StatusCodes.Status400BadRequest)]
+    [ProducesResponseType(StatusCodes.Status404NotFound)]
+    public async Task<ActionResult<ProgressiveSubtitleDto>> GetProgressiveSubtitle(
+        [FromRoute, Required] Guid itemId,
+        [FromRoute, Required] string mediaSourceId,
+        [FromRoute, Required] int index,
+        [FromQuery] long startPositionTicks = 0,
+        [FromQuery] string? session = null,
+        [FromQuery] int since = 0,
+        [FromQuery] int waitMs = 0)
+    {
+        var item = _libraryManager.GetItemById<BaseItem>(itemId);
+        if (item is null)
+        {
+            return NotFound();
+        }
+
+        var mediaSources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, HttpContext.RequestAborted).ConfigureAwait(false);
+        var mediaSource = mediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.OrdinalIgnoreCase));
+        var subtitleStream = mediaSource?.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == index);
+        if (mediaSource is null || subtitleStream is null)
+        {
+            return NotFound();
+        }
+
+        if (subtitleStream.IsExternal
+            || !(string.Equals(subtitleStream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(subtitleStream.Codec, "ssa", StringComparison.OrdinalIgnoreCase)))
+        {
+            return BadRequest("Only embedded ASS/SSA tracks are streamed progressively.");
+        }
+
+        var snapshot = await _progressiveSubtitleExtractor.ReadAsync(
+            mediaSource,
+            index,
+            Math.Max(0, startPositionTicks) / (double)TimeSpan.TicksPerSecond,
+            session,
+            since,
+            TimeSpan.FromMilliseconds(Math.Clamp(waitMs, 0, 10000)),
+            HttpContext.RequestAborted).ConfigureAwait(false);
+
+        return new ProgressiveSubtitleDto
+        {
+            Session = snapshot.SessionId,
+            StartPositionTicks = (long)(snapshot.StartSeconds * TimeSpan.TicksPerSecond),
+            Header = snapshot.Header,
+            Events = snapshot.Events,
+            Next = snapshot.Next,
+            Complete = snapshot.Complete,
+            Failed = snapshot.Failed,
+            CoveredTicks = (long)(snapshot.CoveredSeconds * TimeSpan.TicksPerSecond)
+        };
     }
 
     /// <summary>
