@@ -33,6 +33,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         // behind it by more than this (the client asks a few seconds before the playback position).
         private const double ReuseWindowSeconds = 90;
 
+        // Follow-up reads collect events for at least this long: while ffmpeg runs ahead every
+        // event would otherwise wake the long poll on its own, hundreds of requests per episode.
+        private static readonly TimeSpan _followUpBatch = TimeSpan.FromSeconds(1);
+
         private static readonly TimeSpan _idleTimeout = TimeSpan.FromMinutes(2);
         private static readonly TimeSpan _completedRetention = TimeSpan.FromMinutes(15);
 
@@ -76,16 +80,21 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             var session = GetOrStartSession(mediaSource, streamIndex, Math.Max(0, startSeconds), sessionId);
             since = Math.Max(0, since);
 
-            var deadline = DateTime.UtcNow + wait;
+            var now = DateTime.UtcNow;
+            var deadline = now + wait;
+            // The first read returns with the first events, so the player can start right away.
+            var earliest = since > 0 ? now + _followUpBatch : now;
             while (true)
             {
                 Task changed;
+                bool hasNew;
                 lock (session.Sync)
                 {
                     session.LastAccess = DateTime.UtcNow;
                     // The header alone is not worth a reply: the first events follow it within a
                     // fraction of a second, and a client starting with none would render nothing.
-                    if (session.Events.Count > since || session.Finished)
+                    hasNew = session.Events.Count > since;
+                    if (session.Finished || (hasNew && DateTime.UtcNow >= earliest))
                     {
                         return session.Snapshot(since);
                     }
@@ -93,7 +102,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     changed = session.Changed.Task;
                 }
 
-                var remaining = deadline - DateTime.UtcNow;
+                now = DateTime.UtcNow;
+                var remaining = deadline - now;
                 if (remaining <= TimeSpan.Zero)
                 {
                     lock (session.Sync)
@@ -102,7 +112,17 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     }
                 }
 
-                await Task.WhenAny(changed, Task.Delay(remaining, cancellationToken)).ConfigureAwait(false);
+                if (hasNew)
+                {
+                    // Events are there but the batch window is still open: wait it out.
+                    var batchLeft = earliest - now;
+                    await Task.Delay(batchLeft < remaining ? batchLeft : remaining, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    await Task.WhenAny(changed, Task.Delay(remaining, cancellationToken)).ConfigureAwait(false);
+                }
+
                 cancellationToken.ThrowIfCancellationRequested();
             }
         }
