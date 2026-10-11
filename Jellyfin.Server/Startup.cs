@@ -1,6 +1,7 @@
 using System;
 using System.Globalization;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -218,9 +219,14 @@ namespace Jellyfin.Server
                         ContentTypeProvider = extensionProvider,
                         OnPrepareResponse = (context) =>
                         {
-                            if (Path.GetFileName(context.File.Name).Equals("index.html", StringComparison.Ordinal))
+                            var fileName = Path.GetFileName(context.File.Name);
+                            if (fileName.Equals("index.html", StringComparison.Ordinal))
                             {
                                 context.Context.Response.Headers.CacheControl = new StringValues("no-cache");
+                            }
+                            else if (IsContentHashedWebFile(fileName))
+                            {
+                                context.Context.Response.Headers.CacheControl = new StringValues("public, max-age=31536000, immutable");
                             }
                         }
                     });
@@ -256,6 +262,32 @@ namespace Jellyfin.Server
                     endpoints.MapHealthChecks("/health");
                 });
             });
+        }
+
+        /// <summary>
+        /// Whether a web client file carries a hash of its content in its name (webpack's
+        /// <c>name.[contenthash].chunk.js</c>): its URL changes whenever it does, so browsers can
+        /// keep it without asking again. Not the chunks of HTML templates: plugins rewrite those
+        /// on the fly (File Transformation), under the same name.
+        /// </summary>
+        /// <param name="fileName">The file's name.</param>
+        /// <returns>Whether the file can be cached as immutable.</returns>
+        internal static bool IsContentHashedWebFile(string fileName)
+        {
+            if (fileName.Contains("html", StringComparison.OrdinalIgnoreCase))
+            {
+                return false;
+            }
+
+            foreach (var part in fileName.Split('.'))
+            {
+                if (part.Length >= 16 && part.All(char.IsAsciiHexDigitLower))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
     }
 }
