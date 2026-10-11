@@ -3,6 +3,7 @@ using System.Buffers;
 using System.ComponentModel.DataAnnotations;
 using System.Linq;
 using System.Net.Mime;
+using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Attributes;
 using Jellyfin.Api.Extensions;
@@ -13,6 +14,9 @@ using MediaBrowser.Common.Extensions;
 using MediaBrowser.Controller.Devices;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.Library;
+using MediaBrowser.MediaEncoding.Subtitles;
+using MediaBrowser.Model.Dlna;
+using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.MediaInfo;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Http;
@@ -35,6 +39,7 @@ public class MediaInfoController : BaseJellyfinApiController
     private readonly ILogger<MediaInfoController> _logger;
     private readonly MediaInfoHelper _mediaInfoHelper;
     private readonly IUserManager _userManager;
+    private readonly ProgressiveSubtitleExtractor _progressiveSubtitleExtractor;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="MediaInfoController"/> class.
@@ -45,13 +50,15 @@ public class MediaInfoController : BaseJellyfinApiController
     /// <param name="logger">Instance of the <see cref="ILogger{MediaInfoController}"/> interface.</param>
     /// <param name="mediaInfoHelper">Instance of the <see cref="MediaInfoHelper"/>.</param>
     /// <param name="userManager">Instance of the <see cref="IUserManager"/> interface..</param>
+    /// <param name="progressiveSubtitleExtractor">Instance of the <see cref="ProgressiveSubtitleExtractor"/>.</param>
     public MediaInfoController(
         IMediaSourceManager mediaSourceManager,
         IDeviceManager deviceManager,
         ILibraryManager libraryManager,
         ILogger<MediaInfoController> logger,
         MediaInfoHelper mediaInfoHelper,
-        IUserManager userManager)
+        IUserManager userManager,
+        ProgressiveSubtitleExtractor progressiveSubtitleExtractor)
     {
         _mediaSourceManager = mediaSourceManager;
         _deviceManager = deviceManager;
@@ -59,6 +66,7 @@ public class MediaInfoController : BaseJellyfinApiController
         _logger = logger;
         _mediaInfoHelper = mediaInfoHelper;
         _userManager = userManager;
+        _progressiveSubtitleExtractor = progressiveSubtitleExtractor;
     }
 
     /// <summary>
@@ -217,6 +225,8 @@ public class MediaInfoController : BaseJellyfinApiController
             _mediaInfoHelper.SortMediaSources(info, maxStreamingBitrate, item.Id);
         }
 
+        PrefetchProgressiveSubtitles(item, info, mediaSourceId, subtitleStreamIndex, startTimeTicks);
+
         if (autoOpenLiveStream.Value)
         {
             var mediaSource = string.IsNullOrWhiteSpace(mediaSourceId) ? info.MediaSources[0] : info.MediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.Ordinal));
@@ -341,5 +351,57 @@ public class MediaInfoController : BaseJellyfinApiController
         {
             ArrayPool<byte>.Shared.Return(buffer);
         }
+    }
+
+    /// <summary>
+    /// Starts the progressive read of the subtitle track a web client is about to render.
+    /// </summary>
+    /// <remarks>
+    /// The player asks for the track only once the video is playing; reading it from here instead
+    /// hides the second or two ffmpeg needs to open a remote source and reach the first event.
+    /// Only for an embedded ASS/SSA track the client gets as an external file (the web player),
+    /// not for clients that read embedded tracks themselves.
+    /// </remarks>
+    private void PrefetchProgressiveSubtitles(BaseItem item, PlaybackInfoResponse info, string? mediaSourceId, int? subtitleStreamIndex, long? startTimeTicks)
+    {
+        var source = string.IsNullOrWhiteSpace(mediaSourceId)
+            ? info.MediaSources.FirstOrDefault()
+            : info.MediaSources.FirstOrDefault(i => string.Equals(i.Id, mediaSourceId, StringComparison.OrdinalIgnoreCase));
+        if (source is null)
+        {
+            return;
+        }
+
+        var index = subtitleStreamIndex is >= 0 ? subtitleStreamIndex.Value : source.DefaultSubtitleStreamIndex ?? -1;
+        var stream = source.MediaStreams.FirstOrDefault(i => i.Type == MediaStreamType.Subtitle && i.Index == index);
+        if (stream is null
+            || stream.IsExternal
+            || stream.DeliveryMethod != SubtitleDeliveryMethod.External
+            || !(string.Equals(stream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(stream.Codec, "ssa", StringComparison.OrdinalIgnoreCase)))
+        {
+            return;
+        }
+
+        var sourceId = source.Id;
+        // The player asks from a few seconds before its position, for the line already on screen.
+        var startSeconds = Math.Max(0, ((startTimeTicks ?? 0) / (double)TimeSpan.TicksPerSecond) - 5);
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                // The client sees a virtual source for remote items; the read needs the real one.
+                var sources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, CancellationToken.None).ConfigureAwait(false);
+                var resolved = sources.FirstOrDefault(i => string.Equals(i.Id, sourceId, StringComparison.OrdinalIgnoreCase));
+                if (resolved is not null)
+                {
+                    _progressiveSubtitleExtractor.Prefetch(resolved, index, startSeconds);
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Could not start reading subtitle track {Index} of {Item} ahead of playback", index, item.Id);
+            }
+        });
     }
 }
