@@ -34,6 +34,16 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
                 args);
         }
 
+        [Theory]
+        [InlineData("/stub", MediaBrowser.Model.MediaInfo.MediaProtocol.File, false)]
+        [InlineData("", MediaBrowser.Model.MediaInfo.MediaProtocol.Http, false)]
+        [InlineData("http://stremthru:8080/stremio/store/x", MediaBrowser.Model.MediaInfo.MediaProtocol.Http, true)]
+        public void IsReadable_RejectsPlaceholders(string path, MediaBrowser.Model.MediaInfo.MediaProtocol protocol, bool expected)
+        {
+            var source = new MediaBrowser.Model.Dto.MediaSourceInfo { Path = path, Protocol = protocol };
+            Assert.Equal(expected, ProgressiveSubtitleExtractor.IsReadable(source));
+        }
+
         [Fact]
         public void BuildArguments_DoesNotSeekFromTheStart()
         {
