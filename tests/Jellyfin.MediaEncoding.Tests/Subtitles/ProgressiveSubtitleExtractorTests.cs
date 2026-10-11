@@ -30,7 +30,7 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
             var args = ProgressiveSubtitleExtractor.BuildArguments("\"http://host/file.mkv\"", 3, 600.5);
 
             Assert.Equal(
-                "-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 -ss 600.500 -i \"http://host/file.mkv\" -map 0:3 -an -vn -c:s copy -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1",
+                "-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 -nofind_stream_info -ss 600.500 -i \"http://host/file.mkv\" -map 0:3 -an -vn -c:s copy -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1",
                 args);
         }
 
@@ -71,7 +71,7 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
         {
             var args = ProgressiveSubtitleExtractor.BuildArguments("\"file.mkv\"", 2, 0);
 
-            Assert.StartsWith("-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 -i \"file.mkv\" -map 0:2", args, System.StringComparison.Ordinal);
+            Assert.StartsWith("-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 -nofind_stream_info -i \"file.mkv\" -map 0:2", args, System.StringComparison.Ordinal);
         }
     }
 }
