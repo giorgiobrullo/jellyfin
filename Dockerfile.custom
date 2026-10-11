@@ -1,3 +1,18 @@
+# The web client, from the jellyfin-web fork (branch custom-patches-12, on the web release that
+# matches the server below, v12.2): progressive ASS subtitles (src/plugins/htmlVideoPlayer/
+# progressiveAss.js) need the server's Subtitles/{index}/Progressive endpoint and vice versa.
+# Pinned to a commit: bump WEB_COMMIT with every web change, and rebase the branch onto the new
+# web release tag whenever the base image below moves to a new release.
+FROM node:24-bookworm AS web
+ARG WEB_REPO=https://github.com/giorgiobrullo/jellyfin-web.git
+ARG WEB_COMMIT=cf6ac5f8f857865b4a4cc4dfde8bd181efe41670
+WORKDIR /web
+RUN git init -q . \
+ && git fetch -q --depth 1 "$WEB_REPO" "$WEB_COMMIT" \
+ && git checkout -q FETCH_HEAD \
+ && npm ci --no-audit --no-fund \
+ && npm run build:production
+
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 COPY . .
@@ -21,3 +36,7 @@ FROM ghcr.io/hotio/jellyfin:release@sha256:f267a94bc66983073f20b9765291dd0f72b48
 COPY --from=build /build/encoding/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
 COPY --from=build /build/implementations/Emby.Server.Implementations.dll /usr/lib/jellyfin/bin/Emby.Server.Implementations.dll
 COPY --from=build /build/api/Jellyfin.Api.dll /usr/lib/jellyfin/bin/Jellyfin.Api.dll
+# The whole web client is replaced, so no chunk of the stock build is left behind; ui/ is not
+# part of it (in k3s it is the abyss-spotlight theme mounted over this path).
+RUN rm -rf /usr/share/jellyfin/web && mkdir -p /usr/share/jellyfin/web
+COPY --from=web /web/dist/ /usr/share/jellyfin/web/
