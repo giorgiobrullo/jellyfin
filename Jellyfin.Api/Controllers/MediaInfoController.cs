@@ -390,12 +390,21 @@ public class MediaInfoController : BaseJellyfinApiController
         {
             try
             {
-                // The client sees a virtual source for remote items; the read needs the real one.
-                var sources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, CancellationToken.None).ConfigureAwait(false);
-                var resolved = sources.FirstOrDefault(i => string.Equals(i.Id, sourceId, StringComparison.OrdinalIgnoreCase));
-                if (resolved is not null)
+                // The client sees a virtual source for remote items and the read needs the real one,
+                // which right after PlaybackInfo can still be the placeholder: try a few times.
+                for (var attempt = 0; attempt < 3; attempt++)
                 {
-                    _progressiveSubtitleExtractor.Prefetch(resolved, index, startSeconds);
+                    if (attempt > 0)
+                    {
+                        await Task.Delay(500).ConfigureAwait(false);
+                    }
+
+                    var sources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, CancellationToken.None).ConfigureAwait(false);
+                    var resolved = sources.FirstOrDefault(i => string.Equals(i.Id, sourceId, StringComparison.OrdinalIgnoreCase));
+                    if (resolved is not null && _progressiveSubtitleExtractor.Prefetch(resolved, index, startSeconds))
+                    {
+                        return;
+                    }
                 }
             }
             catch (Exception ex)

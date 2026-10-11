@@ -332,6 +332,12 @@ public class SubtitleController : BaseJellyfinApiController
             return BadRequest("Only embedded ASS/SSA tracks are streamed progressively.");
         }
 
+        if (!ProgressiveSubtitleExtractor.IsReadable(mediaSource))
+        {
+            // A remote source not resolved yet: the player falls back to the regular track.
+            return NotFound();
+        }
+
         var snapshot = await _progressiveSubtitleExtractor.ReadAsync(
             mediaSource,
             index,

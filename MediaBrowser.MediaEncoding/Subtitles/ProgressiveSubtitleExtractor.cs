@@ -37,7 +37,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         // event would otherwise wake the long poll on its own, hundreds of requests per episode.
         private static readonly TimeSpan _followUpBatch = TimeSpan.FromSeconds(1);
 
-        private static readonly TimeSpan _idleTimeout = TimeSpan.FromMinutes(2);
+        // A player following a read asks at least every few seconds; a read nobody asks about is one
+        // left behind (the viewer moved to the next episode) and would keep downloading the whole
+        // file, taking bandwidth from the read that matters now.
+        private static readonly TimeSpan _idleTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan _completedRetention = TimeSpan.FromMinutes(15);
 
         private readonly IMediaEncoder _mediaEncoder;
@@ -51,7 +54,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         {
             _mediaEncoder = mediaEncoder;
             _logger = logger;
-            _reaper = new Timer(_ => Reap(), null, TimeSpan.FromSeconds(30), TimeSpan.FromSeconds(30));
+            _reaper = new Timer(_ => Reap(), null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
         }
 
         /// <summary>
@@ -134,16 +137,41 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// <param name="mediaSource">The media source holding the track.</param>
         /// <param name="streamIndex">The subtitle stream index.</param>
         /// <param name="startSeconds">Where the player will ask from.</param>
-        public void Prefetch(MediaSourceInfo mediaSource, int streamIndex, double startSeconds)
+        /// <returns>Whether a read was started or joined; false for a source not resolved yet.</returns>
+        public bool Prefetch(MediaSourceInfo mediaSource, int streamIndex, double startSeconds)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(mediaSource);
+
+            if (!IsReadable(mediaSource))
+            {
+                return false;
+            }
 
             var session = GetOrStartSession(mediaSource, streamIndex, Math.Max(0, startSeconds), null);
             lock (session.Sync)
             {
                 session.LastAccess = DateTime.UtcNow;
             }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Whether a source can be opened: a remote item's source is a placeholder until its
+        /// stream has been resolved (Gelato hands out /stub), and ffmpeg fails on it at once.
+        /// </summary>
+        /// <param name="mediaSource">The media source.</param>
+        /// <returns>Whether ffmpeg can read it.</returns>
+        public static bool IsReadable(MediaSourceInfo mediaSource)
+        {
+            var path = mediaSource.Path;
+            if (string.IsNullOrEmpty(path))
+            {
+                return false;
+            }
+
+            return mediaSource.Protocol != MediaBrowser.Model.MediaInfo.MediaProtocol.File || System.IO.File.Exists(path);
         }
 
         /// <summary>
