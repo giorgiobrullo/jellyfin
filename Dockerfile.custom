@@ -5,7 +5,7 @@
 # web release tag whenever the base image below moves to a new release.
 FROM node:24-bookworm AS web
 ARG WEB_REPO=https://github.com/giorgiobrullo/jellyfin-web.git
-ARG WEB_COMMIT=a8cd1adec50643544c050b47508363f03ec7c294
+ARG WEB_COMMIT=7cb29873bf6ff355a978a69adab5b048aa0f8fc5
 WORKDIR /web
 RUN git init -q . \
  && git fetch -q --depth 1 "$WEB_REPO" "$WEB_COMMIT" \
