@@ -279,7 +279,7 @@ public class SubtitleController : BaseJellyfinApiController
     }
 
     /// <summary>
-    /// Streams an embedded ASS/SSA track while it is read from the source.
+    /// Streams an embedded text subtitle track while it is read from the source, as ASS events.
     /// </summary>
     /// <remarks>
     /// A full extraction of a remote file downloads all of it before returning anything. This reads
@@ -294,7 +294,7 @@ public class SubtitleController : BaseJellyfinApiController
     /// <param name="since">The number of events the client already has from that extraction.</param>
     /// <param name="waitMs">How long to wait for new events before replying, at most 10000.</param>
     /// <response code="200">Events returned.</response>
-    /// <response code="400">The track is not an embedded ASS/SSA track.</response>
+    /// <response code="400">The track is not an embedded text track.</response>
     /// <response code="404">Item, media source or track not found.</response>
     /// <returns>The <see cref="ProgressiveSubtitleDto"/>.</returns>
     [HttpGet("Videos/{itemId}/{mediaSourceId}/Subtitles/{index}/Progressive")]
@@ -325,11 +325,9 @@ public class SubtitleController : BaseJellyfinApiController
             return NotFound();
         }
 
-        if (subtitleStream.IsExternal
-            || !(string.Equals(subtitleStream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(subtitleStream.Codec, "ssa", StringComparison.OrdinalIgnoreCase)))
+        if (subtitleStream.IsExternal || !ProgressiveSubtitleExtractor.IsStreamable(subtitleStream.Codec))
         {
-            return BadRequest("Only embedded ASS/SSA tracks are streamed progressively.");
+            return BadRequest("Only embedded text tracks (ASS/SSA, SRT, WebVTT, mov_text) are streamed progressively.");
         }
 
         if (!ProgressiveSubtitleExtractor.IsReadable(mediaSource))
@@ -341,6 +339,7 @@ public class SubtitleController : BaseJellyfinApiController
         var snapshot = await _progressiveSubtitleExtractor.ReadAsync(
             mediaSource,
             index,
+            subtitleStream.Codec,
             Math.Max(0, startPositionTicks) / (double)TimeSpan.TicksPerSecond,
             session,
             since,

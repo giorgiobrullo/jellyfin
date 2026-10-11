@@ -34,6 +34,28 @@ namespace Jellyfin.MediaEncoding.Subtitles.Tests
                 args);
         }
 
+        [Fact]
+        public void BuildArguments_ConvertsTextTracksToAssEvents()
+        {
+            var args = ProgressiveSubtitleExtractor.BuildArguments("\"file.mkv\"", 4, 0, convertToAss: true);
+
+            Assert.Contains("-map 0:4 -an -vn -c:s ass -copyts", args, System.StringComparison.Ordinal);
+        }
+
+        [Theory]
+        [InlineData("ass", true)]
+        [InlineData("SSA", true)]
+        [InlineData("subrip", true)]
+        [InlineData("webvtt", true)]
+        [InlineData("mov_text", true)]
+        [InlineData("PGSSUB", false)]
+        [InlineData("dvdsub", false)]
+        [InlineData(null, false)]
+        public void IsStreamable_TakesTextTracksOnly(string? codec, bool expected)
+        {
+            Assert.Equal(expected, ProgressiveSubtitleExtractor.IsStreamable(codec));
+        }
+
         [Theory]
         [InlineData("/stub", MediaBrowser.Model.MediaInfo.MediaProtocol.File, false)]
         [InlineData("", MediaBrowser.Model.MediaInfo.MediaProtocol.Http, false)]
