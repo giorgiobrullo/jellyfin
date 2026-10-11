@@ -359,7 +359,7 @@ public class MediaInfoController : BaseJellyfinApiController
     /// <remarks>
     /// The player asks for the track only once the video is playing; reading it from here instead
     /// hides the second or two ffmpeg needs to open a remote source and reach the first event.
-    /// Only for an embedded ASS/SSA track the client gets as an external file (the web player),
+    /// Only for an embedded text track the client gets as an external file (the web player),
     /// not for clients that read embedded tracks themselves.
     /// </remarks>
     private void PrefetchProgressiveSubtitles(BaseItem item, PlaybackInfoResponse info, string? mediaSourceId, int? subtitleStreamIndex, long? startTimeTicks)
@@ -377,13 +377,13 @@ public class MediaInfoController : BaseJellyfinApiController
         if (stream is null
             || stream.IsExternal
             || stream.DeliveryMethod != SubtitleDeliveryMethod.External
-            || !(string.Equals(stream.Codec, "ass", StringComparison.OrdinalIgnoreCase)
-                || string.Equals(stream.Codec, "ssa", StringComparison.OrdinalIgnoreCase)))
+            || !ProgressiveSubtitleExtractor.IsStreamable(stream.Codec))
         {
             return;
         }
 
         var sourceId = source.Id;
+        var codec = stream.Codec;
         // The player asks from a few seconds before its position, for the line already on screen.
         var startSeconds = Math.Max(0, ((startTimeTicks ?? 0) / (double)TimeSpan.TicksPerSecond) - 5);
         _ = Task.Run(async () =>
@@ -401,7 +401,7 @@ public class MediaInfoController : BaseJellyfinApiController
 
                     var sources = await _mediaSourceManager.GetPlaybackMediaSources(item, null, true, false, CancellationToken.None).ConfigureAwait(false);
                     var resolved = sources.FirstOrDefault(i => string.Equals(i.Id, sourceId, StringComparison.OrdinalIgnoreCase));
-                    if (resolved is not null && _progressiveSubtitleExtractor.Prefetch(resolved, index, startSeconds))
+                    if (resolved is not null && _progressiveSubtitleExtractor.Prefetch(resolved, index, codec, startSeconds))
                     {
                         return;
                     }

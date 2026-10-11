@@ -62,6 +62,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// </summary>
         /// <param name="mediaSource">The media source holding the track.</param>
         /// <param name="streamIndex">The subtitle stream index (also the ffmpeg stream index).</param>
+        /// <param name="codec">The track's codec (see <see cref="IsStreamable"/>).</param>
         /// <param name="startSeconds">Where to start reading when a new session is needed.</param>
         /// <param name="sessionId">The session a client is following, if any.</param>
         /// <param name="since">The number of events the client already has from that session.</param>
@@ -71,6 +72,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         public async Task<ProgressiveSubtitleSnapshot> ReadAsync(
             MediaSourceInfo mediaSource,
             int streamIndex,
+            string? codec,
             double startSeconds,
             string? sessionId,
             int since,
@@ -80,7 +82,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(mediaSource);
 
-            var session = GetOrStartSession(mediaSource, streamIndex, Math.Max(0, startSeconds), sessionId);
+            var session = GetOrStartSession(mediaSource, streamIndex, !IsAss(codec), Math.Max(0, startSeconds), sessionId);
             since = Math.Max(0, since);
 
             var now = DateTime.UtcNow;
@@ -131,14 +133,27 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         }
 
         /// <summary>
+        /// Whether a track's codec can be read progressively: ASS/SSA as they are, the text formats
+        /// (SRT, WebVTT, mov_text) converted to ASS events on the way.
+        /// </summary>
+        /// <param name="codec">The subtitle codec.</param>
+        /// <returns>Whether the track can be streamed.</returns>
+        public static bool IsStreamable(string? codec)
+            => IsAss(codec) || codec?.ToLowerInvariant() is "subrip" or "srt" or "webvtt" or "mov_text";
+
+        private static bool IsAss(string? codec)
+            => codec?.ToLowerInvariant() is "ass" or "ssa";
+
+        /// <summary>
         /// Starts reading a track before anyone asks for it, so the first events are there when
         /// the player does (it asks once the video has started, a second or two later).
         /// </summary>
         /// <param name="mediaSource">The media source holding the track.</param>
         /// <param name="streamIndex">The subtitle stream index.</param>
+        /// <param name="codec">The track's codec (see <see cref="IsStreamable"/>).</param>
         /// <param name="startSeconds">Where the player will ask from.</param>
         /// <returns>Whether a read was started or joined; false for a source not resolved yet.</returns>
-        public bool Prefetch(MediaSourceInfo mediaSource, int streamIndex, double startSeconds)
+        public bool Prefetch(MediaSourceInfo mediaSource, int streamIndex, string? codec, double startSeconds)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ArgumentNullException.ThrowIfNull(mediaSource);
@@ -148,7 +163,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 return false;
             }
 
-            var session = GetOrStartSession(mediaSource, streamIndex, Math.Max(0, startSeconds), null);
+            var session = GetOrStartSession(mediaSource, streamIndex, !IsAss(codec), Math.Max(0, startSeconds), null);
             lock (session.Sync)
             {
                 session.LastAccess = DateTime.UtcNow;
@@ -224,8 +239,9 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// <param name="inputArgument">The quoted input, as built by the media encoder.</param>
         /// <param name="streamIndex">The subtitle stream index.</param>
         /// <param name="startSeconds">The start position.</param>
+        /// <param name="convertToAss">Whether the track is a text format to convert to ASS events.</param>
         /// <returns>The arguments.</returns>
-        internal static string BuildArguments(string inputArgument, int streamIndex, double startSeconds)
+        internal static string BuildArguments(string inputArgument, int streamIndex, double startSeconds, bool convertToAss = false)
         {
             // -ss before -i seeks through the container index, so only the part of the file from the
             // start position onwards is read; -copyts keeps the original event times.
@@ -236,10 +252,10 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 : string.Empty;
             return string.Create(
                 CultureInfo.InvariantCulture,
-                $"-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s copy -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
+                $"-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s {(convertToAss ? "ass" : "copy")} -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
         }
 
-        private Session GetOrStartSession(MediaSourceInfo mediaSource, int streamIndex, double startSeconds, string? sessionId)
+        private Session GetOrStartSession(MediaSourceInfo mediaSource, int streamIndex, bool convertToAss, double startSeconds, string? sessionId)
         {
             lock (_lock)
             {
@@ -268,7 +284,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     oldest.Stop();
                 }
 
-                session = new Session(mediaSource.Path, streamIndex, startSeconds);
+                session = new Session(mediaSource.Path, streamIndex, startSeconds, convertToAss);
                 _sessions.Add(session);
                 Start(session, mediaSource);
                 return session;
@@ -277,7 +293,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
         private void Start(Session session, MediaSourceInfo mediaSource)
         {
-            var arguments = BuildArguments(_mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource), session.StreamIndex, session.StartSeconds);
+            var arguments = BuildArguments(_mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource), session.StreamIndex, session.StartSeconds, session.ConvertToAss);
             var process = new Process
             {
                 StartInfo = new ProcessStartInfo
@@ -455,8 +471,9 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
         private sealed class Session
         {
-            public Session(string path, int streamIndex, double startSeconds)
+            public Session(string path, int streamIndex, double startSeconds, bool convertToAss)
             {
+                ConvertToAss = convertToAss;
                 Id = Guid.NewGuid().ToString("N", CultureInfo.InvariantCulture);
                 Path = path;
                 StreamIndex = streamIndex;
@@ -473,6 +490,8 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             public int StreamIndex { get; }
 
             public double StartSeconds { get; }
+
+            public bool ConvertToAss { get; }
 
             public Process? Process { get; set; }
 
