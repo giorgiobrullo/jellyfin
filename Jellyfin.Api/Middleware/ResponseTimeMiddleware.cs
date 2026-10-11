@@ -59,6 +59,7 @@ public class ResponseTimeMiddleware
             }
 
             context.Response.Headers[ResponseHeaderResponseTime] = responseTimeMs.ToString(CultureInfo.InvariantCulture);
+            WebClientCaching.Apply(context);
             return Task.CompletedTask;
         });
 

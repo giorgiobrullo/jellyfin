@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Net.Http;
 using System.Threading;
 using System.Threading.Tasks;
 using Jellyfin.Api.Controllers;
@@ -11,6 +12,7 @@ using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Providers;
 using MediaBrowser.Controller.Subtitles;
+using MediaBrowser.MediaEncoding.Subtitles;
 using MediaBrowser.Model.Dto;
 using MediaBrowser.Model.Entities;
 using MediaBrowser.Model.IO;
@@ -132,6 +134,7 @@ public class SubtitleControllerTests
             mediaSourceManager.Object,
             Mock.Of<IProviderManager>(),
             fileSystem.Object,
-            NullLogger<SubtitleController>.Instance);
+            NullLogger<SubtitleController>.Instance,
+            new ProgressiveSubtitleExtractor(Mock.Of<IMediaEncoder>(), Mock.Of<IHttpClientFactory>(), NullLogger<ProgressiveSubtitleExtractor>.Instance));
     }
 }
