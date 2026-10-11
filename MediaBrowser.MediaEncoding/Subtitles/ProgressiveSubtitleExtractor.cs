@@ -1,15 +1,19 @@
 #pragma warning disable CS1591
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
+using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using MediaBrowser.Common.Net;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Model.Dto;
+using MediaBrowser.Model.MediaInfo;
 using Microsoft.Extensions.Logging;
 
 namespace MediaBrowser.MediaEncoding.Subtitles
@@ -43,16 +47,25 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         private static readonly TimeSpan _idleTimeout = TimeSpan.FromSeconds(30);
         private static readonly TimeSpan _completedRetention = TimeSpan.FromMinutes(15);
 
+        // A debrid link redirects (addon, then the debrid's CDN) and ffmpeg follows the redirect
+        // again for each of the half-dozen ranges a seek takes, doubling them: the link is resolved
+        // once and the CDN address kept for a while.
+        private static readonly TimeSpan _resolvedLinkLifetime = TimeSpan.FromMinutes(10);
+        private static readonly TimeSpan _resolveTimeout = TimeSpan.FromSeconds(3);
+
         private readonly IMediaEncoder _mediaEncoder;
+        private readonly IHttpClientFactory _httpClientFactory;
+        private readonly ConcurrentDictionary<string, (string Url, DateTime Expires)> _resolvedLinks = new(StringComparer.Ordinal);
         private readonly ILogger<ProgressiveSubtitleExtractor> _logger;
         private readonly Lock _lock = new();
         private readonly List<Session> _sessions = new();
         private readonly Timer _reaper;
         private bool _disposed;
 
-        public ProgressiveSubtitleExtractor(IMediaEncoder mediaEncoder, ILogger<ProgressiveSubtitleExtractor> logger)
+        public ProgressiveSubtitleExtractor(IMediaEncoder mediaEncoder, IHttpClientFactory httpClientFactory, ILogger<ProgressiveSubtitleExtractor> logger)
         {
             _mediaEncoder = mediaEncoder;
+            _httpClientFactory = httpClientFactory;
             _logger = logger;
             _reaper = new Timer(_ => Reap(), null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5));
         }
@@ -246,13 +259,14 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             // -ss before -i seeks through the container index, so only the part of the file from the
             // start position onwards is read; -copyts keeps the original event times.
             // No stream analysis: the track's codec data is in the Matroska header, and probing the
-            // audio and video read another ~5 MB (about a second) before the first event.
+            // audio and video read another ~5 MB (about a second) before the first event;
+            // -nofind_stream_info also skips the decoding of the first packets that remains.
             var seek = startSeconds > 0
                 ? string.Create(CultureInfo.InvariantCulture, $"-ss {startSeconds:F3} ")
                 : string.Empty;
             return string.Create(
                 CultureInfo.InvariantCulture,
-                $"-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s {(convertToAss ? "ass" : "copy")} -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
+                $"-nostdin -hide_banner -loglevel error -analyzeduration 0 -probesize 1000000 -nofind_stream_info {seek}-i {inputArgument} -map 0:{streamIndex} -an -vn -c:s {(convertToAss ? "ass" : "copy")} -copyts -flush_packets 1 -f ass -ignore_readorder 1 pipe:1");
         }
 
         private Session GetOrStartSession(MediaSourceInfo mediaSource, int streamIndex, bool convertToAss, double startSeconds, string? sessionId)
@@ -286,14 +300,68 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
                 session = new Session(mediaSource.Path, streamIndex, startSeconds, convertToAss);
                 _sessions.Add(session);
-                Start(session, mediaSource);
+                _ = StartAsync(session, mediaSource);
                 return session;
             }
         }
 
-        private void Start(Session session, MediaSourceInfo mediaSource)
+        private async Task<string> ResolveLinkAsync(MediaSourceInfo mediaSource)
         {
-            var arguments = BuildArguments(_mediaEncoder.GetInputArgument(mediaSource.Path, mediaSource), session.StreamIndex, session.StartSeconds, session.ConvertToAss);
+            var path = mediaSource.Path;
+            if (mediaSource.Protocol != MediaProtocol.Http
+                || !Uri.TryCreate(path, UriKind.Absolute, out var uri)
+                || (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                return path;
+            }
+
+            if (_resolvedLinks.TryGetValue(path, out var known) && known.Expires > DateTime.UtcNow)
+            {
+                return known.Url;
+            }
+
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Get, uri);
+                request.Headers.Range = new System.Net.Http.Headers.RangeHeaderValue(0, 0);
+                foreach (var header in mediaSource.RequiredHttpHeaders ?? new Dictionary<string, string>())
+                {
+                    request.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
+
+                using var cts = new CancellationTokenSource(_resolveTimeout);
+                using var response = await _httpClientFactory.CreateClient(NamedClient.Default)
+                    .SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cts.Token)
+                    .ConfigureAwait(false);
+                var final = response.RequestMessage?.RequestUri;
+                if (response.IsSuccessStatusCode && final is not null && final != uri)
+                {
+                    _resolvedLinks[path] = (final.AbsoluteUri, DateTime.UtcNow + _resolvedLinkLifetime);
+                    foreach (var stale in _resolvedLinks.Where(e => e.Value.Expires <= DateTime.UtcNow).ToList())
+                    {
+                        _resolvedLinks.TryRemove(stale.Key, out _);
+                    }
+
+                    return final.AbsoluteUri;
+                }
+            }
+            catch (Exception ex) when (ex is HttpRequestException or OperationCanceledException or InvalidOperationException or FormatException)
+            {
+                _logger.LogDebug(ex, "Could not resolve the link of a progressive subtitle source, reading it as it is");
+            }
+
+            return path;
+        }
+
+        private async Task StartAsync(Session session, MediaSourceInfo mediaSource)
+        {
+            var input = await ResolveLinkAsync(mediaSource).ConfigureAwait(false);
+            if (session.Stopped)
+            {
+                return;
+            }
+
+            var arguments = BuildArguments(_mediaEncoder.GetInputArgument(input, mediaSource), session.StreamIndex, session.StartSeconds, session.ConvertToAss);
             var process = new Process
             {
                 StartInfo = new ProcessStartInfo
@@ -311,12 +379,14 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 EnableRaisingEvents = true
             };
 
+            // Not the input: a debrid link carries the account's token.
             _logger.LogInformation(
-                "Progressive subtitle extraction of track {Index} from {Start:F1}s: {Path} {Arguments}",
+                "Progressive subtitle extraction of track {Index} from {Start:F1}s{Resolved}: {Path} {Arguments}",
                 session.StreamIndex,
                 session.StartSeconds,
+                string.Equals(input, mediaSource.Path, StringComparison.Ordinal) ? string.Empty : " (resolved link)",
                 _mediaEncoder.EncoderPath,
-                arguments);
+                BuildArguments("<input>", session.StreamIndex, session.StartSeconds, session.ConvertToAss));
 
             try
             {
@@ -336,7 +406,17 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                 return;
             }
 
-            session.Process = process;
+            lock (session.Sync)
+            {
+                session.Process = process;
+            }
+
+            if (session.Stopped)
+            {
+                // Stopped while ffmpeg was starting.
+                session.Stop();
+            }
+
             _ = DrainErrorAsync(process, session);
             _ = PumpAsync(process, session);
         }
@@ -534,12 +614,18 @@ namespace MediaBrowser.MediaEncoding.Subtitles
 
             public void Stop()
             {
-                Stopped = true;
+                Process? process;
+                lock (Sync)
+                {
+                    Stopped = true;
+                    process = Process;
+                }
+
                 try
                 {
-                    if (Process is { HasExited: false })
+                    if (process is { HasExited: false })
                     {
-                        Process.Kill(true);
+                        process.Kill(true);
                     }
                 }
                 catch (InvalidOperationException)
@@ -547,7 +633,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     // Already gone.
                 }
 
-                Process?.Dispose();
+                process?.Dispose();
             }
         }
     }
