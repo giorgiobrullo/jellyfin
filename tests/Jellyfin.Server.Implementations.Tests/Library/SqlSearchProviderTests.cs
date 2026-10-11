@@ -88,6 +88,49 @@ public sealed class SqlSearchProviderTests : SqliteDbTestFixture
         Assert.Equal([_primaryId], hits);
     }
 
+    [Fact]
+    public async Task SearchAsync_TypesWithoutItems_DoNotChangeTheResults()
+    {
+        RestrictUserTo(_movieLibraryId, _movie4KLibraryId);
+
+        var hits = await SearchAsync([BaseItemKind.Movie, BaseItemKind.Book, BaseItemKind.Photo, BaseItemKind.Playlist]).ConfigureAwait(true);
+
+        Assert.Equal([_primaryId], hits);
+    }
+
+    [Fact]
+    public async Task SearchAsync_OnlyTypesWithoutItems_FindsNothing()
+    {
+        RestrictUserTo(_movieLibraryId, _movie4KLibraryId);
+
+        var hits = await SearchAsync([BaseItemKind.Book, BaseItemKind.Photo]).ConfigureAwait(true);
+
+        Assert.Empty(hits);
+    }
+
+    [Fact]
+    public async Task SearchAsync_TypeAddedAfterTheFirstSearch_IsFound()
+    {
+        RestrictUserTo(_movieLibraryId, _movie4KLibraryId);
+        Assert.Empty(await SearchAsync([BaseItemKind.Book]).ConfigureAwait(true));
+
+        var bookId = Guid.Parse("eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee");
+        var book = new Book { Id = bookId, Name = "Coco" };
+        var context = CreateDbContext();
+        await using (context.ConfigureAwait(true))
+        {
+            var entity = CreateMovie(bookId, book.GetType().ToString(), _movieLibraryId, null);
+            entity.IsMovie = false;
+            entity.MediaType = "Book";
+            context.BaseItems.Add(entity);
+            await context.SaveChangesAsync(CancellationToken.None).ConfigureAwait(true);
+        }
+
+        _libraryManager.Raise(l => l.ItemAdded += null, _libraryManager.Object, new ItemChangeEventArgs { Item = book });
+
+        Assert.Equal([bookId], await SearchAsync([BaseItemKind.Book]).ConfigureAwait(true));
+    }
+
     private void RestrictUserTo(params Guid[] libraryIds)
     {
         _libraryManager
@@ -95,10 +138,10 @@ public sealed class SqlSearchProviderTests : SqliteDbTestFixture
             .Callback<InternalItemsQuery, User>((query, _) => query.TopParentIds = libraryIds);
     }
 
-    private async Task<List<Guid>> SearchAsync()
+    private async Task<List<Guid>> SearchAsync(BaseItemKind[]? includeItemTypes = null)
     {
         var results = await _provider.SearchAsync(
-            new SearchProviderQuery { SearchTerm = "coco", UserId = _user.Id, Limit = 10 },
+            new SearchProviderQuery { SearchTerm = "coco", UserId = _user.Id, Limit = 10, IncludeItemTypes = includeItemTypes ?? [] },
             CancellationToken.None).ConfigureAwait(false);
 
         return results.Select(r => r.ItemId).ToList();
