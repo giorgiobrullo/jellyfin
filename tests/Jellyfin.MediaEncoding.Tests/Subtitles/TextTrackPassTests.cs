@@ -158,6 +158,140 @@ public sealed class TextTrackPassTests : IDisposable
     }
 
     [Fact]
+    public void ChunkRanges_OverlapTheirNeighbours()
+    {
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+
+        Assert.Equal((0d, 370d), ranges[0]);
+        Assert.Equal((330d, 720d), ranges[1]);
+        Assert.Equal((1030d, 1400d), ranges[3]);
+    }
+
+    [Fact]
+    public void Chunks_AgreeWhenTheyHoldTheSameOverlap()
+    {
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteAssChunk(0, 10, 200, 340, 355),
+            WriteAssChunk(1, 332, 340, 355, 500, 690, 705),
+            WriteAssChunk(2, 690, 705, 900, 1040, 1055),
+            WriteAssChunk(3, 1040, 1055, 1300),
+        };
+
+        Assert.Equal(-1, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "ass"));
+    }
+
+    [Fact]
+    public void Chunks_DisagreeWhenOneCameBackEmpty()
+    {
+        // A read that failed at once: the header, no events, exit code 0.
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteAssChunk(0),
+            WriteAssChunk(1, 332, 340, 355, 500, 690, 705),
+            WriteAssChunk(2, 690, 705, 900, 1040, 1055),
+            WriteAssChunk(3, 1040, 1055, 1300),
+        };
+
+        Assert.Equal(0, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "ass"));
+    }
+
+    [Fact]
+    public void Chunks_DisagreeWhenOneStoppedEarly()
+    {
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteAssChunk(0, 10, 200, 340, 355),
+            WriteAssChunk(1, 332, 340, 355, 500),
+            WriteAssChunk(2, 690, 705, 900, 1040, 1055),
+            WriteAssChunk(3, 1040, 1055, 1300),
+        };
+
+        Assert.Equal(1, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "ass"));
+    }
+
+    [Fact]
+    public void Chunks_AgreeAtTheEdgesOfTheOverlap()
+    {
+        // The seek of the later chunk lands before its start and the earlier one stops at its
+        // end: events right at the edges of the overlap are in one chunk only.
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteAssChunk(0, 10, 345, 368),
+            WriteAssChunk(1, 328, 331, 345, 600),
+            WriteAssChunk(2, 900),
+            WriteAssChunk(3, 1300),
+        };
+
+        Assert.Equal(-1, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "ass"));
+    }
+
+    [Fact]
+    public void SrtChunks_DisagreeWhenOneIsMissing()
+    {
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteSrtChunk(0, 10, 340),
+            Path.Combine(_cacheDirectory, "chunk_1.srt"),
+            WriteSrtChunk(2, 900),
+            WriteSrtChunk(3, 1300),
+        };
+
+        Assert.Equal(0, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "srt"));
+    }
+
+    [Fact]
+    public void SrtChunks_AgreeWhatEverTheirNumbering()
+    {
+        var ranges = SubtitleEncoder.GetChunkRanges(1400);
+        var paths = new[]
+        {
+            WriteSrtChunk(0, 10, 200, 340),
+            WriteSrtChunk(1, 340, 500),
+            WriteSrtChunk(2, 900),
+            WriteSrtChunk(3, 1300),
+        };
+
+        Assert.Equal(-1, SubtitleEncoder.FindDisagreeingChunk(paths, ranges, "srt"));
+    }
+
+    private string WriteAssChunk(int chunk, params int[] eventStarts)
+    {
+        var path = Path.Combine(_cacheDirectory, string.Create(CultureInfo.InvariantCulture, $"chunk_{chunk}.ass"));
+        var lines = new List<string>
+        {
+            "[Script Info]",
+            "ScriptType: v4.00+",
+            string.Empty,
+            "[Events]",
+            "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+        };
+        lines.AddRange(eventStarts.Select(s => string.Create(CultureInfo.InvariantCulture, $"Dialogue: 0,{AssTime(s)},{AssTime(s + 2)},Default,,0,0,0,,Line at {s}")));
+        File.WriteAllLines(path, lines);
+        return path;
+    }
+
+    private string WriteSrtChunk(int chunk, params int[] eventStarts)
+    {
+        var path = Path.Combine(_cacheDirectory, string.Create(CultureInfo.InvariantCulture, $"chunk_{chunk}.srt"));
+        File.WriteAllText(path, string.Concat(eventStarts.Select((s, i) => string.Create(
+            CultureInfo.InvariantCulture,
+            $"{i + 1}\n{SrtTime(s)} --> {SrtTime(s + 2)}\nLine at {s}\n\n"))));
+        return path;
+    }
+
+    private static string AssTime(int seconds)
+        => TimeSpan.FromSeconds(seconds).ToString(@"h\:mm\:ss\.ff", CultureInfo.InvariantCulture);
+
+    private static string SrtTime(int seconds)
+        => TimeSpan.FromSeconds(seconds).ToString(@"hh\:mm\:ss\,fff", CultureInfo.InvariantCulture);
+
+    [Fact]
     public void Watched_WhenAnySessionPlaysTheSource()
     {
         // A SyncPlay group: one member moved on, another still plays the source.

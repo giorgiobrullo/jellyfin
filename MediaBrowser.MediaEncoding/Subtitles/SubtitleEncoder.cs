@@ -49,6 +49,13 @@ namespace MediaBrowser.MediaEncoding.Subtitles
         /// </summary>
         private const double ParallelChunkOverlapSeconds = 20;
 
+        /// <summary>
+        /// Seconds trimmed off each side of an overlap before comparing two chunks' events there:
+        /// an input seek lands on the cluster before its time and -to cuts at a packet, so the
+        /// edges differ between chunks even when both are complete.
+        /// </summary>
+        private const double ParallelChunkCompareMarginSeconds = 5;
+
         private readonly ILogger<SubtitleEncoder> _logger;
         private readonly IFileSystem _fileSystem;
         private readonly IMediaEncoder _mediaEncoder;
@@ -1157,16 +1164,12 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     string.Join(", ", tracks.Select(t => t.StreamIndex)),
                     mediaSource.Path);
 
-                var chunkSize = durationSeconds / ParallelChunks;
+                var ranges = GetChunkRanges(durationSeconds);
                 var chunks = new List<Task<(int ExitCode, string StandardError)>>();
                 for (var i = 0; i < ParallelChunks; i++)
                 {
-                    var rawStart = i * chunkSize;
-                    var rawEnd = (i == ParallelChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
-                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : ParallelChunkOverlapSeconds));
-                    var end = Math.Min(durationSeconds, rawEnd + ParallelChunkOverlapSeconds);
                     var chunk = i;
-                    var args = BuildTextTrackChunkArguments(inputPath, start, end, tracks.Select(t => (t.FfmpegIndex, t.Codec, ChunkPath(chunk, t))));
+                    var args = BuildTextTrackChunkArguments(inputPath, ranges[i].Start, ranges[i].End, tracks.Select(t => (t.FfmpegIndex, t.Codec, ChunkPath(chunk, t))));
                     chunks.Add(RunSubtitleExtractionProcess(args, stop.Token));
                 }
 
@@ -1192,6 +1195,21 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     var chunkPaths = Enumerable.Range(0, ParallelChunks).Select(i => ChunkPath(i, track)).ToList();
                     if (!chunkPaths.Any(p => File.Exists(p) && new FileInfo(p).Length > 0))
                     {
+                        continue;
+                    }
+
+                    // ffmpeg ends a read that fails partway like a finished one, exit code 0 and all,
+                    // so a chunk can come back short: once the first of four held no events at
+                    // all and the cached track lost its first five minutes.
+                    var disagreeing = FindDisagreeingChunk(chunkPaths, ranges, track.Format);
+                    if (disagreeing >= 0)
+                    {
+                        _logger.LogWarning(
+                            "Chunks {First} and {Second} of subtitle track {Index} disagree where they overlap, one of them came back short; leaving the track to a single read for {File}",
+                            disagreeing,
+                            disagreeing + 1,
+                            track.StreamIndex,
+                            mediaSource.Path);
                         continue;
                     }
 
@@ -1300,7 +1318,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             string format,
             CancellationToken cancellationToken)
         {
-            var chunkSize = durationSeconds / ParallelChunks;
+            var ranges = GetChunkRanges(durationSeconds);
 
             var outputDir = Path.GetDirectoryName(outputPath) ?? throw new ArgumentException("Invalid output path", nameof(outputPath));
             var baseName = Path.GetFileNameWithoutExtension(outputPath);
@@ -1314,10 +1332,7 @@ namespace MediaBrowser.MediaEncoding.Subtitles
             {
                 for (var i = 0; i < ParallelChunks; i++)
                 {
-                    var rawStart = i * chunkSize;
-                    var rawEnd = (i == ParallelChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
-                    var start = Math.Max(0, rawStart - (i == 0 ? 0 : ParallelChunkOverlapSeconds));
-                    var end = Math.Min(durationSeconds, rawEnd + ParallelChunkOverlapSeconds);
+                    var (start, end) = ranges[i];
                     var chunkPath = Path.Combine(tempDir, $"chunk_{i}.{format}");
                     chunkPaths.Add(chunkPath);
 
@@ -1345,6 +1360,12 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     throw new InvalidOperationException("All subtitle chunks produced empty output");
                 }
 
+                var disagreeing = FindDisagreeingChunk(chunkPaths, ranges, format);
+                if (disagreeing >= 0)
+                {
+                    throw new InvalidOperationException(string.Create(CultureInfo.InvariantCulture, $"Subtitle chunks {disagreeing} and {disagreeing + 1} disagree where they overlap"));
+                }
+
                 if (string.Equals(format, "ass", StringComparison.OrdinalIgnoreCase))
                 {
                     MergeAssChunks(chunkPaths, outputPath);
@@ -1365,6 +1386,107 @@ namespace MediaBrowser.MediaEncoding.Subtitles
                     _logger.LogDebug(ex, "Failed to clean up subtitle chunk tempdir {Dir}", tempDir);
                 }
             }
+        }
+
+        /// <summary>
+        /// The time range of each chunk of a parallel extraction, overlapping its neighbours.
+        /// </summary>
+        internal static (double Start, double End)[] GetChunkRanges(double durationSeconds)
+        {
+            var chunkSize = durationSeconds / ParallelChunks;
+            var ranges = new (double Start, double End)[ParallelChunks];
+            for (var i = 0; i < ParallelChunks; i++)
+            {
+                var rawStart = i * chunkSize;
+                var rawEnd = (i == ParallelChunks - 1) ? durationSeconds : (i + 1) * chunkSize;
+                ranges[i] = (
+                    Math.Max(0, rawStart - (i == 0 ? 0 : ParallelChunkOverlapSeconds)),
+                    Math.Min(durationSeconds, rawEnd + ParallelChunkOverlapSeconds));
+            }
+
+            return ranges;
+        }
+
+        /// <summary>
+        /// Finds a pair of neighbouring chunks that do not hold the same events where they overlap.
+        /// </summary>
+        /// <remarks>
+        /// Two complete chunks hold the same events inside their overlap, so a difference means one
+        /// of them stopped early or never got going. Overlaps without events cannot tell.
+        /// </remarks>
+        /// <returns>The index of the first chunk of the pair, or -1 when they all agree.</returns>
+        internal static int FindDisagreeingChunk(IReadOnlyList<string> chunkPaths, IReadOnlyList<(double Start, double End)> ranges, string format)
+        {
+            var isAss = string.Equals(format, "ass", StringComparison.OrdinalIgnoreCase);
+            var events = chunkPaths.Select(p => isAss ? ReadAssChunkEvents(p) : ReadSrtChunkEvents(p)).ToList();
+            for (var i = 0; i + 1 < events.Count; i++)
+            {
+                var from = ranges[i + 1].Start + ParallelChunkCompareMarginSeconds;
+                var to = ranges[i].End - ParallelChunkCompareMarginSeconds;
+                if (from >= to)
+                {
+                    continue;
+                }
+
+                var left = events[i].Where(e => e.StartSeconds >= from && e.StartSeconds <= to).Select(e => e.Key).ToHashSet(StringComparer.Ordinal);
+                var right = events[i + 1].Where(e => e.StartSeconds >= from && e.StartSeconds <= to).Select(e => e.Key);
+                if (!left.SetEquals(right))
+                {
+                    return i;
+                }
+            }
+
+            return -1;
+        }
+
+        private static List<(double StartSeconds, string Key)> ReadAssChunkEvents(string chunkPath)
+        {
+            var events = new List<(double StartSeconds, string Key)>();
+            if (!File.Exists(chunkPath))
+            {
+                return events;
+            }
+
+            var inEvents = false;
+            foreach (var line in File.ReadLines(chunkPath))
+            {
+                if (line.StartsWith("[Events]", StringComparison.OrdinalIgnoreCase))
+                {
+                    inEvents = true;
+                }
+                else if (inEvents
+                    && (line.StartsWith("Dialogue:", StringComparison.OrdinalIgnoreCase) || line.StartsWith("Comment:", StringComparison.OrdinalIgnoreCase)))
+                {
+                    events.Add((ParseAssStartSeconds(line), line));
+                }
+            }
+
+            return events;
+        }
+
+        private static List<(double StartSeconds, string Key)> ReadSrtChunkEvents(string chunkPath)
+        {
+            var events = new List<(double StartSeconds, string Key)>();
+            if (!File.Exists(chunkPath))
+            {
+                return events;
+            }
+
+            var text = File.ReadAllText(chunkPath).Replace("\r\n", "\n", StringComparison.Ordinal);
+            foreach (var block in text.Split("\n\n", StringSplitOptions.RemoveEmptyEntries))
+            {
+                var blockLines = block.Split('\n');
+                var timeLineIdx = Array.FindIndex(blockLines, l => l.Contains("-->", StringComparison.Ordinal));
+                if (timeLineIdx < 0)
+                {
+                    continue;
+                }
+
+                var body = string.Join('\n', blockLines.Skip(timeLineIdx + 1)).TrimEnd();
+                events.Add((ParseSrtStartSeconds(blockLines[timeLineIdx]), blockLines[timeLineIdx] + "|" + body));
+            }
+
+            return events;
         }
 
         /// <summary>
