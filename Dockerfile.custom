@@ -1,11 +1,11 @@
 # The web client, from the jellyfin-web fork (branch custom-patches-12, on the web release that
-# matches the server below, v12.2): progressive ASS subtitles (src/plugins/htmlVideoPlayer/
+# matches the server below, v12.4): progressive ASS subtitles (src/plugins/htmlVideoPlayer/
 # progressiveAss.js) need the server's Subtitles/{index}/Progressive endpoint and vice versa.
 # Pinned to a commit: bump WEB_COMMIT with every web change, and rebase the branch onto the new
 # web release tag whenever the base image below moves to a new release.
 FROM node:24-bookworm AS web
 ARG WEB_REPO=https://github.com/giorgiobrullo/jellyfin-web.git
-ARG WEB_COMMIT=7267db01a1434c7b18f68c8bccae7ebdc65871d1
+ARG WEB_COMMIT=166109b6acee003d7f3583f9831aabeafcb14275
 WORKDIR /web
 RUN git init -q . \
  && git fetch -q --depth 1 "$WEB_REPO" "$WEB_COMMIT" \
@@ -24,15 +24,15 @@ RUN dotnet build MediaBrowser.MediaEncoding/MediaBrowser.MediaEncoding.csproj -c
  && dotnet build Jellyfin.Api/Jellyfin.Api.csproj -c Release -o /build/api -p:Version=24.4.0.0
 
 # The patched assemblies replace the stock ones, so they have to be built from the
-# exact Jellyfin release the base image ships. This branch sits on v12.2 and
-# the digest below is hotio's `release` tag at 12.2 (2026-10-08): bump both
+# exact Jellyfin release the base image ships. This branch sits on v12.4 and
+# the digest below is hotio's `release-12.4` tag (2026-11-06): bump both
 # together, never one without the other. A new patch in another project needs
 # its assembly added here. Jellyfin.Api does not compile SharedVersion.cs: the
-# release build gives it its own version (24.4.0.0 in 12.2, see the stock DLL's
+# release build gives it its own version (24.4.0.0 in 12.4, see the stock DLL's
 # version resource) and the other assemblies reference that one, so it has to be
 # built with it or the server does not start (FileNotFoundException at startup).
 # Test a new image with `docker run` before it replaces the running one.
-FROM ghcr.io/hotio/jellyfin:release@sha256:f267a94bc66983073f20b9765291dd0f72b48f49aac9bc08ccda778079d57a9c
+FROM ghcr.io/hotio/jellyfin:release-12.4@sha256:0bef966a1f56fd7545e5d62d688577ff4de848b653e68bf9237fbf6b83fa3fa1
 COPY --from=build /build/encoding/MediaBrowser.MediaEncoding.dll /usr/lib/jellyfin/bin/MediaBrowser.MediaEncoding.dll
 COPY --from=build /build/implementations/Emby.Server.Implementations.dll /usr/lib/jellyfin/bin/Emby.Server.Implementations.dll
 COPY --from=build /build/api/Jellyfin.Api.dll /usr/lib/jellyfin/bin/Jellyfin.Api.dll
